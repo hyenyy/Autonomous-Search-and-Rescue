@@ -59,7 +59,6 @@ def main():
     step_i = 0
     last_snap = -1e9
     last_cam = -1e9
-    last_yolo = -1e9
     yolo_cache = []
     last_state = None
     done_logged = False
@@ -81,7 +80,9 @@ def main():
         if info["state"] != last_state:
             last_state = info["state"]
             print(f"[sar] t={now:6.1f}s → {last_state} "
-                  f"pose=({pose[0]:+.2f},{pose[1]:+.2f})")
+                  f"pose=({pose[0]:+.2f},{pose[1]:+.2f}) "
+                  f"battery={info['battery']:.1f}% "
+                  f"reason={info['return_reason']}")
         # 목표 확정 순간의 카메라 프레임 저장 — "무엇을 목표로 봤는가"
         # 검증용 (디코이 오인 디버깅에 결정적)
         if info["found"] and not found_saved and img is not None:
@@ -100,13 +101,11 @@ def main():
             # 경량 렌더 — matplotlib figure는 제어 루프를 수백 ms 블록
             viz.save_fast(os.path.join(SNAPSHOT_DIR, "live_map.png"),
                           pose=pose, info=info)
-        # 카메라 라이브 뷰 (블롭=노랑, YOLO=초록). YOLO는 후보가 보일 때만
-        # 4초 간격으로 (CPU 추론 ~0.2s — 상시 돌리면 그 자체가 병목)
+        # 카메라 라이브 뷰 (HSV=노랑, apple=초록, table=하늘색).
+        # YOLO 추론은 detector.process()에서 이미 수행되므로 결과만 재사용한다.
         if now - last_cam >= 1.0 and img is not None:
             last_cam = now
-            if mission.detector.visible and now - last_yolo >= 4.0:
-                last_yolo = now
-                yolo_cache = mission.detector.yolo_boxes(img)
+            yolo_cache = mission.detector.yolo_boxes(img)
             viz.save_camera(os.path.join(SNAPSHOT_DIR, "live_cam.png"),
                             img, det=mission.detector.last,
                             yolo_boxes=yolo_cache)

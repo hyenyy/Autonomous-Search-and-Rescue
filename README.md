@@ -23,8 +23,7 @@
 ```bash
 # Python 3.10+ (개발은 3.12, 코드는 3.10 호환 문법만 사용)
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt        # numpy, matplotlib(선택)
-.venv/bin/pip install ultralytics                # 선택: YOLO 디코이 베토
+.venv/bin/pip install -r requirements.txt        # numpy, matplotlib, ultralytics
 ```
 
 `controllers/sar_controller/runtime.ini` 의 파이썬 경로를 **자기 머신의
@@ -50,7 +49,7 @@ webots worlds/apartment_sar.wbt        # 실시간 GUI
 ### Webots 없이 검증 (오프라인 시뮬레이터)
 
 ```bash
-.venv/bin/python run_tests.py                    # 단위 테스트 (13개)
+.venv/bin/python run_tests.py                    # 단위 테스트 (19개)
 .venv/bin/python sim_offline.py --scenario rooms_two   # 2사과 E2E 미션
 .venv/bin/python sim_offline.py --sweep          # 6개 지형 × 사람 × 시드 매트릭스
 .venv/bin/python sim_offline.py --snapshots      # out/에 지도 PNG 저장
@@ -60,7 +59,9 @@ webots worlds/apartment_sar.wbt        # 실시간 GUI
 
 ```
 센서 → PoseEstimator(인코더+컴퍼스 캘리브레이션) → OccupancyGrid(동적 빔 제외)
-     → 색 탐지(HSV 블롭+기하 게이트) → 위치 추정(LiDAR 일관성/단안 폴백)
+     → YOLO apple(47)/dining table(60) 의미 인식
+     → 사과 박스 내부 HSV 빨강 검증 / 테이블 다리 사이 가상장애물 생성
+     → 위치 추정(LiDAR 일관성/단안 폴백)
      → Mission 상태기계(SPIN→EXPLORE→SEEK→GOTO→…→RETURN)
      → A*(사람 캡슐·영토 페널티) + pure pursuit → 정적 안전 클램프 → (v, ω)
 ```
@@ -70,7 +71,8 @@ webots worlds/apartment_sar.wbt        # 실시간 GUI
 | `sar/config.py` | 모든 튜너블 — **당일엔 사실상 이 파일만 수정** |
 | `sar/odometry.py` | 차동구동 odometry + Webots 컴퍼스 부호 보정·오프셋 캘리브레이션 |
 | `sar/mapping.py` | log-odds Occupancy Grid (벡터화, 동적 빔 제외 통합) |
-| `sar/detection.py` | HSV 블롭 + 디코이 방어 게이트 + 단안 거리 + YOLO 베토 |
+| `sar/detection.py` | YOLO apple(47) 우선 탐지 + 박스 내부 HSV 빨강 검증 + 단안 거리 |
+| `sar/semantic_obstacles.py` | YOLO 테이블 박스 + LiDAR 다리 결합, 우회용 가상 장벽 생성 |
 | `sar/exploration.py` | frontier 클러스터·점수화(사람 방향 후순위)·관성·블랙리스트 |
 | `sar/planning.py` | A*(코너컷 금지·예측 캡슐 페널티) + 추종 + 충돌 코리도 안전 클램프 |
 | `sar/state_machine.py` | 다중 목표 미션 로직 + 동적 장애물 분류 + recovery |
@@ -86,12 +88,11 @@ webots worlds/apartment_sar.wbt        # 실시간 GUI
    반환하므로 `atan2(v[1],v[0]) = 북쪽각 − θ` (기울기 −1). 부호 반전 후
    시작 헤딩(제공값)으로 오프셋 캘리브레이션. *(멀티에이전트 리뷰가 발견,
    codex 교차검증 — 시뮬레이션으로는 탐지 불가능한 결함이었음)*
-3. **디코이 방어 다층 게이트** — 아파트 월드의 빨간 디코이들을 실측으로
-   각개 격파: 소화기(화면 상단 접촉=키 큰 물체 기각), 라디에이터 노브
-   (채도 s≥0.60 — 순색 사과 S≥0.65 vs 재질색 ≤0.54 실측 분리),
-   OrderSign(수평선 위 블롭 기각), 소다캔(YOLO 베토 + 확정단계 종횡비).
-   **yolo11n은 Webots 사과를 'apple'로 인식 못 하므로**(실측) YOLO는
-   양성 확인이 아니라 **거부권(베토)**으로만 사용.
+3. **YOLO 우선 + 색상 후검증** — 매 카메라 프레임에서 강사 자료의 COCO
+   `apple` 클래스 47만 먼저 탐지한다. 그 박스 안에 빨간 HSV 픽셀이 충분하고
+   크기·위치·종횡비·채움비 게이트까지 통과해야 최종 빨간 사과 후보가 된다.
+   `use_yolo=true`인데 모델을 로드하지 못하면 HSV 단독으로 우회하지 않고
+   탐지를 비활성화해 빨간 캔 등의 오탐을 막는다.
 4. **가려진 사과 대응 2단계 게이트** — 탐지 단계는 느슨(반달형도 SEEK 추적),
    **위치 확정은 온전한 원형일 때만**(가림 상태의 단안 거리는 2배 오차).
 5. **이동 보행자 스택** — §"움직이는 장애물" 참고. 사람이 로봇보다 빠를
@@ -120,8 +121,8 @@ webots worlds/apartment_sar.wbt        # 실시간 GUI
 - **오프라인 스윕**: 6개 지형(방·2사과·복도·개방·미로) × 사람(실측 0.2m/s)
   유무 × 시드 — 게이트 전 케이스 **무충돌**, 2사과 시나리오 완주
   (사람 케이스 일부는 안전 우선으로 느림)
-- **Webots 실전**: apartment 월드 E2E 완주 (디코이 4종 실측 차단),
-  practice_arena 104.9s 완주
+- **Webots 실전**: 기존 HSV 우선 버전으로 apartment/practice_arena 완주 이력.
+  현재 YOLO 우선 변경분은 실제 Webots 카메라 화면으로 재검증 필요
 - **품질 공정**: 오프라인 스윕으로 회귀 검증 → 멀티에이전트 적대 리뷰
   (23 에이전트, 치명 결함 3건 발견) → codex 교차검증 → 실기 스모크
 
@@ -134,5 +135,7 @@ HSV 보정 절차, 흔한 증상→원인 표, 제출 전 동결 절차.
 
 - 로봇(0.21m/s)보다 2배 빠른 왕복 차단자는 물리적으로 회피 보장 불가
   (스트레스 케이스로만 유지 — 실전 보행자는 0.2m/s)
+- 기본 YOLO11n이 Webots 사과 렌더를 COCO `apple`로 잡는지는 당일 실제
+  카메라 화면에서 확인 필요. 미검출이면 제공 모델/커스텀 가중치로 교체
 - green 사과는 텍스처 기반이라 HSV 범위가 넓음 — 당일 실화면 보정 필요
 - 목표가 책상 위에 있는 규칙이면 "수평선 위 기각" 게이트 완화 필요

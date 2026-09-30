@@ -495,5 +495,6 @@ if __name__ == "__main__":
             with_person=not args.no_person,
             snapshots=args.snapshots, seed=args.seed)
     ok = is_success(r)
-    print("\nMISSION " + ("SUCCESS ✅" if ok else "FAILED ❌"))
+    # Windows 기본 cp949 콘솔에서도 결과 출력 뒤 정상 종료되도록 ASCII 사용.
+    print("\nMISSION " + ("SUCCESS" if ok else "FAILED"))
     sys.exit(0 if ok else 1)

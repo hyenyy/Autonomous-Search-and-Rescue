@@ -77,13 +77,37 @@ class DetectionConfig:
     # 이 거리 안에서의 추정만 '확정'에 사용 (원거리 단안은 픽셀 양자화로
     # ±25% 오차 — 멀면 SEEK로 접근해서 다시 잰다)
     est_confirm_dist: float = 2.2
-    # YOLO 확정 게이트 (주최측 제공 모델 경로 관례: models/YOLO/yolo11n.pt)
-    # 색·기하만으로 못 거르는 디코이(빨간 음료캔 등) 방어. 확정 직전
-    # 1회만 실행. ultralytics/모델 없으면 자동 통과.
+    # YOLO-first 탐지: COCO apple(47) 박스를 먼저 찾고, 그 박스 안에서
+    # 위 HSV 빨간색 범위를 만족하는 픽셀 블롭이 있어야 최종 후보가 된다.
+    # 강사 예제와 동일한 YOLO11n/COCO ID/conf/IoU 기본값.
     use_yolo: bool = False
-    yolo_model: str = "yolo11n.pt"
-    yolo_conf: float = 0.12
-    decoy_radius: float = 0.6            # m, YOLO가 기각한 위치 주변 재확정 금지
+    yolo_model: str = "models/YOLO/yolo11n.pt"
+    yolo_class_id: int = 47              # COCO: apple
+    yolo_conf: float = 0.10
+    yolo_iou: float = 0.50
+    # YOLO 박스 중 최소 이 비율이 빨간색이어야 red apple로 인정.
+    yolo_red_min_ratio: float = 0.05
+
+
+@dataclass
+class TableConfig:
+    """RGB 의미 인식 + 2D LiDAR 다리 결합 기반 테이블 회피."""
+    enabled: bool = True
+    yolo_class_id: int = 60              # COCO: dining table
+    yolo_conf: float = 0.35
+    # 너무 작게 보이는 먼 테이블은 다리-박스 대응이 불안정하므로 무시.
+    min_box_width_ratio: float = 0.08
+    max_lidar_range: float = 2.8
+    # 가장 가까운 다리보다 이 거리 안쪽인 LiDAR 점만 같은 테이블 후보.
+    leg_depth_band: float = 0.45
+    min_leg_gap: float = 0.22
+    max_leg_gap: float = 2.8
+    barrier_thickness: float = 0.10
+    confirm_frames: int = 3
+    track_resolution: float = 0.40
+    track_timeout: float = 1.0
+    # RECOVER 후진 중 이 거리보다 가까운 물체가 뒤에 있으면 즉시 중단.
+    recover_rear_stop: float = 0.30
 
 
 @dataclass
@@ -154,6 +178,23 @@ class ExploreConfig:
 
 
 @dataclass
+class EnergyConfig:
+    """주행 거리 기반 배터리 추정과 안전 귀환 설정.
+
+    Webots 기본 로봇에 실제 배터리 센서가 없어도 시연 가능한 보수적
+    에너지 모델이다. 실제 센서가 제공되면 initial_percent 대신 센서 값을
+    EnergyManager에 주입하도록 교체하면 된다.
+    """
+    enabled: bool = True
+    initial_percent: float = 100.0
+    percent_per_meter: float = 1.0
+    percent_per_radian: float = 0.03
+    reserve_percent: float = 15.0
+    # breadcrumb 귀환 거리는 실제 우회·회피를 고려해 이 배수만큼 여유를 둔다.
+    return_multiplier: float = 1.25
+
+
+@dataclass
 class MissionConfig:
     start_x: float = 0.0                 # 시작 포즈 (대회에서 제공되는 값)
     start_y: float = 0.0
@@ -176,9 +217,11 @@ class Config:
     lidar: LidarConfig = field(default_factory=LidarConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
+    table: TableConfig = field(default_factory=TableConfig)
     map: MapConfig = field(default_factory=MapConfig)
     plan: PlanConfig = field(default_factory=PlanConfig)
     explore: ExploreConfig = field(default_factory=ExploreConfig)
+    energy: EnergyConfig = field(default_factory=EnergyConfig)
     mission: MissionConfig = field(default_factory=MissionConfig)
 
     def apply_overrides(self, path):

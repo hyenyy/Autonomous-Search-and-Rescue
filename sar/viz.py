@@ -73,8 +73,10 @@ class MapViz:
             out[y0:y1 + 1, x0:x0 + 2] = color
             out[y0:y1 + 1, max(0, x1 - 1):x1 + 1] = color
 
-        for (_name, _conf, (a, b, c, d)) in yolo_boxes:
-            rect(a, b, c, d, (0, 255, 0))
+        for (name, _conf, (a, b, c, d)) in yolo_boxes:
+            color = (0, 210, 255) if name.lower() in ("dining table", "table") \
+                else (0, 255, 0)
+            rect(a, b, c, d, color)
         if det is not None and det.bbox is not None:
             rect(*det.bbox, (255, 255, 0))
         mpimage.imsave(path, out)

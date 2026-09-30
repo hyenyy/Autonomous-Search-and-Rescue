@@ -10,9 +10,11 @@ import math
 from .breadcrumbs import Breadcrumbs
 from .detection import (TargetDetector, estimate_target_position,
                         estimate_target_position_mono)
+from .energy import EnergyManager
 from .exploration import FrontierExplorer
 from .geometry import dist, wrap_angle
 from .planning import LocalAvoider, Planner
+from .semantic_obstacles import TableObstacleMapper
 
 
 class Mission:
@@ -32,7 +34,9 @@ class Mission:
         self.explorer = FrontierExplorer(cfg, grid)
         self.detector = TargetDetector(cfg)
         self.crumbs = Breadcrumbs(cfg)
+        self.energy = EnergyManager(cfg)
         self.avoider = LocalAvoider(cfg)
+        self.table_mapper = TableObstacleMapper(cfg, grid)
 
         self.start_xy = (cfg.mission.start_x, cfg.mission.start_y)
         self.state = self.SPIN
@@ -48,11 +52,12 @@ class Mission:
 
         self.target_est = None       # (x, y) 현재 추적 중인 목표 추정
         self._est_hist = []          # 최근 채택된 추정들 (안정성 게이트용)
-        self._decoys = []            # YOLO가 기각한 디코이 위치들
         self.visited_targets = []    # 방문 완료한 목표 위치들
         self._seek_block_until = -1e9
         self.target_found = False    # '현재' 목표 확정 여부
         self.target_reached = False  # '모든' 목표 방문 완료 여부
+        self.return_reason = None    # MISSION_COMPLETE/LOW_BATTERY/...
+        self.table_cells_added = 0   # 카메라+LiDAR 가상 테이블 장애물 셀
 
         # stuck 감지
         self._pose_hist = []         # [(t, x, y)]
@@ -126,10 +131,8 @@ class Mission:
                 accepted, acc_d = (mono[0], mono[1]), mono[2]
         if accepted is None:
             return
-        # 등록된 디코이(YOLO 기각 위치)·이미 방문한 목표 주변 추정은 버린다
-        r_d = self.cfg.detection.decoy_radius
-        if any(dist(accepted, dc) < r_d for dc in self._decoys):
-            return
+        # 이미 방문한 목표 주변 추정은 버린다.
+        # 빨간 캔 같은 디코이는 이 단계 전에 YOLO apple(47) 필터에서 제거된다.
         r_v = self.cfg.mission.visited_radius
         if any(dist(accepted, vt) < r_v for vt in self.visited_targets):
             return
@@ -298,23 +301,23 @@ class Mission:
         # 오염시켜 crumb 폴백이 꼬리를 무는 것 방지)
         if self.state not in (self.RETURN, self.DONE):
             self.crumbs.record(pose)
+        self.energy.update(pose)
         self.detector.process(camera_img)
+        table_added = self.table_mapper.update(
+            now, pose, angles, ranges,
+            camera_img.shape[1] if camera_img is not None else 0,
+            self.detector.table_boxes())
+        if table_added:
+            self.table_cells_added += table_added
+            # 기존 경로가 방금 생성한 테이블 장벽을 관통할 수 있으므로 즉시 갱신.
+            if self.planner.goal is not None:
+                self.planner.plan_to(pose, self.planner.goal, now, force=True)
         if self.detector.visible:
             self._update_target_estimate(pose, angles, ranges)
         if self.detector.confirmed and not self.target_found \
                 and self.target_est is not None and self._estimate_stable():
-            # 최종 게이트: YOLO(활성 시)가 후보 블롭을 'apple'로 인정해야
-            # 확정. 기각되면 그 위치를 디코이로 등록하고 추정 리셋 —
-            # 빨간 음료캔 같은 색·기하 통과형 디코이 방어.
-            if self.detector.yolo_confirm(camera_img, self.detector.last):
-                self.target_found = True
-            else:
-                print(f"[mission] YOLO 기각 → 디코이 등록 "
-                      f"({self.target_est[0]:+.2f},{self.target_est[1]:+.2f})")
-                self._decoys.append(self.target_est)
-                self.target_est = None
-                self._est_hist.clear()
-                self._seek_block_until = now + 20.0
+            # detector.process()에서 이미 YOLO apple → HSV red 검증을 마쳤다.
+            self.target_found = True
 
         # 목표 확정(위치 추정 성공) → 접근 전환 (복귀/완료 전이면)
         # RECOVER는 제외: 래치가 1틱 만에 복구를 선점하면 stuck 영구화
@@ -322,7 +325,6 @@ class Mission:
                 and self.state in (self.SPIN, self.EXPLORE, self.SEEK):
             self._enter(self.GOTO_TARGET, now)
         # 목표 보이지만 위치 미확정 → bearing 추종으로 접근해서 재측정
-        # (YOLO가 디코이로 기각한 직후에는 쿨다운 — 캔을 향한 무한 추종 방지)
         elif not self.target_found and not self.target_reached \
                 and self.detector.confirmed \
                 and now > self._seek_block_until \
@@ -337,7 +339,23 @@ class Mission:
                 and self.state in (self.SPIN, self.EXPLORE, self.SEEK,
                                    self.GOTO_TARGET) \
                 and now - self.start_time > cfg.mission.give_up_time:
+            self.return_reason = "TIMEOUT"
             self._enter(self.RETURN, now)
+
+        # 에너지 안전 계층은 목표 추적보다 우선한다. 고정 20% 임계값이
+        # 아니라 현재 위치에서 breadcrumb로 귀환하는 데 필요한 양과
+        # reserve를 비교한다. RECOVER 중이면 복구 직후 곧바로 귀환한다.
+        active = (self.SPIN, self.EXPLORE, self.SEEK, self.GOTO_TARGET)
+        if self.state in active and self.energy.should_return(pose, self.crumbs):
+            self.return_reason = "LOW_BATTERY"
+            print(f"[mission] 저전력 안전 귀환 — battery="
+                  f"{self.energy.percent:.1f}% required="
+                  f"{self.energy.required_return_percent(pose, self.crumbs):.1f}%")
+            self._enter(self.RETURN, now)
+        elif self.state == self.RECOVER \
+                and self.energy.should_return(pose, self.crumbs):
+            self.return_reason = "LOW_BATTERY"
+            self._recover_after = self.RETURN
 
         # stuck → RECOVER (SPIN/DONE/RECOVER 제외)
         if self.state in (self.EXPLORE, self.SEEK, self.GOTO_TARGET,
@@ -419,6 +437,11 @@ class Mission:
             "found": self.target_found,
             "visited": len(self.visited_targets),
             "reached": self.target_reached,
+            "battery": self.energy.percent,
+            "return_required": self.energy.required_return_percent(
+                pose, self.crumbs),
+            "return_reason": self.return_reason,
+            "table_cells": self.table_cells_added,
         }
         return v, w, info
 
@@ -508,6 +531,8 @@ class Mission:
                 self._enter(self.SPIN, now)
                 return 0.0, 0.0
             self._enter(self.RETURN, now)
+            if self.return_reason is None:
+                self.return_reason = "SEARCH_EXHAUSTED"
             return 0.0, 0.0
         ok = self.planner.plan_to(pose, target, now)
         if not ok:
@@ -567,6 +592,7 @@ class Mission:
             self._seek_block_until = now + 8.0   # 방금 그 사과 응시 방지
             if k >= cfg.mission.num_targets:
                 self.target_reached = True
+                self.return_reason = "MISSION_COMPLETE"
                 self._enter(self.RETURN, now)
             else:
                 self._enter(self.EXPLORE, now)
@@ -618,6 +644,22 @@ class Mission:
     def _do_recover(self, now, pose, angles, ranges):
         phase, t0 = self._recover_phase
         if phase == "backup":
+            # 기존의 맹목적인 1.2초 후진은 테이블 반대편 다리에 다시
+            # 부딪힐 수 있다. 후방 로봇 폭 안의 실제 여유를 매 틱 확인한다.
+            import numpy as np
+            a = np.asarray(angles)
+            r = np.asarray(ranges)
+            valid = np.isfinite(r) & (r > self.cfg.lidar.min_range)
+            rear_forward = r * np.cos(wrap_angle(a - math.pi))
+            rear_lateral = r * np.sin(wrap_angle(a - math.pi))
+            rear_corridor = valid & (rear_forward > 0.02) \
+                & (np.abs(rear_lateral) < self.cfg.robot.robot_radius
+                   + self.cfg.plan.corridor_margin)
+            rear_min = float(rear_forward[rear_corridor].min()) \
+                if rear_corridor.any() else self.cfg.lidar.max_range
+            if rear_min <= self.cfg.table.recover_rear_stop:
+                self._recover_phase = ("spin", now)
+                return 0.0, 0.0
             if now - t0 < 1.2:
                 return -0.08, 0.0
             self._recover_phase = ("spin", now)

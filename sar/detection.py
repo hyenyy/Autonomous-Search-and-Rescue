@@ -1,9 +1,13 @@
-"""목표 물체 색 기반 탐지 (pure NumPy — OpenCV 불필요).
+"""YOLO-first 목표 탐지 + HSV 색상 검증.
 
-- RGB → HSV 변환 후 config의 HSV 범위로 마스크
+- YOLO11n COCO apple(class 47) 박스를 먼저 탐지
+- 각 apple 박스 안에서만 HSV 빨간색 블롭을 검사해 red apple 확정
 - 최소 픽셀 수 + N프레임 연속 확인으로 오탐 억제
+- use_yolo=False인 오프라인/단위 테스트에서는 기존 HSV 단독 모드 지원
 - 출력 bearing: 로봇 프레임, +값 = 왼쪽(CCW). 화면 왼쪽 = +bearing
 """
+from pathlib import Path
+
 import numpy as np
 
 
@@ -55,79 +59,110 @@ class TargetDetector:
         self.last = None              # 마지막 Detection
         self._yolo = None
         self._yolo_failed = False
+        self._last_yolo_boxes = []
+        self._last_table_boxes = []
 
-    def yolo_warmup(self):
-        """모델 로드+더미 추론을 미션 시작 전에 — 확정 순간 수 초 블록 방지."""
-        if not self.cfg.detection.use_yolo or self._yolo_failed:
-            return
+    def _yolo_classes(self):
+        classes = [self.cfg.detection.yolo_class_id]
+        if self.cfg.table.enabled:
+            classes.append(self.cfg.table.yolo_class_id)
+        return classes
+
+    def _model_source(self):
+        """상대 모델 경로는 저장소 루트 기준으로 찾고, 없으면 자동 다운로드."""
+        configured = Path(self.cfg.detection.yolo_model)
+        if configured.is_absolute():
+            return str(configured)
+        repo_path = Path(__file__).resolve().parents[1] / configured
+        if repo_path.exists():
+            return str(repo_path)
+        # Ultralytics 공식 가중치 이름이면 basename만 넘겨 자동 다운로드.
+        return configured.name
+
+    def _ensure_yolo(self):
+        if self._yolo is not None:
+            return True
+        if self._yolo_failed or not self.cfg.detection.use_yolo:
+            return False
         try:
             from ultralytics import YOLO
-            self._yolo = YOLO(self.cfg.detection.yolo_model)
-            self._yolo.predict(source=np.zeros((64, 64, 3), dtype=np.uint8),
-                               conf=0.5, verbose=False)
-            print("[detection] YOLO 워밍업 완료")
+            self._yolo = YOLO(self._model_source())
+            return True
         except Exception as e:
-            print(f"[detection] YOLO 사용 불가({e}) — 게이트 자동 통과")
+            print(f"[detection] YOLO 사용 불가({e}) — apple 탐지 비활성")
             self._yolo_failed = True
+            return False
+
+    def yolo_warmup(self):
+        """모델 로드+더미 추론을 미션 시작 전에 수행."""
+        if not self.cfg.detection.use_yolo or self._yolo_failed:
+            return
+        if not self._ensure_yolo():
+            return
+        try:
+            self._yolo.predict(source=np.zeros((64, 64, 3), dtype=np.uint8),
+                               conf=self.cfg.detection.yolo_conf,
+                               iou=self.cfg.detection.yolo_iou,
+                               classes=self._yolo_classes(),
+                               verbose=False)
+            print("[detection] YOLO 워밍업 완료 — COCO apple(47) 우선 탐지")
+        except Exception as e:
+            print(f"[detection] YOLO 워밍업 실패({e}) — apple 탐지 비활성")
+            self._yolo_failed = True
+            self._yolo = None
+
+    def _predict_apples(self, img_rgb):
+        """한 번의 YOLO 추론으로 apple과 dining table을 분리한다."""
+        self._last_yolo_boxes = []
+        self._last_table_boxes = []
+        if img_rgb is None or not self._ensure_yolo():
+            return []
+        dcfg = self.cfg.detection
+        try:
+            result = self._yolo.predict(
+                source=img_rgb[..., ::-1],       # RGB -> BGR
+                conf=dcfg.yolo_conf,
+                iou=dcfg.yolo_iou,
+                classes=self._yolo_classes(),
+                verbose=False,
+            )[0]
+        except Exception as e:
+            print(f"[detection] YOLO 추론 실패({e}) — 이번 프레임 무시")
+            return []
+
+        apple_boxes = []
+        table_boxes = []
+        for box in result.boxes:
+            # Ultralytics는 길이 1인 torch.Tensor를 돌려준다. numpy 기반
+            # 테스트 더블과도 호환되도록 첫 원소를 명시적으로 꺼낸다.
+            cls_id = int(box.cls[0])
+            name = result.names[cls_id]
+            name_lower = name.lower()
+            is_apple = cls_id == dcfg.yolo_class_id or name_lower == "apple"
+            is_table = self.cfg.table.enabled and (
+                cls_id == self.cfg.table.yolo_class_id
+                or name_lower in ("dining table", "table"))
+            # classes 필터가 무시되는 커스텀 모델에도 안전하게 재확인.
+            if not is_apple and not is_table:
+                continue
+            conf = float(box.conf[0])
+            xyxy = [float(v) for v in box.xyxy[0]]
+            item = (name, conf, xyxy)
+            if is_apple:
+                apple_boxes.append(item)
+            elif conf >= self.cfg.table.yolo_conf:
+                table_boxes.append(item)
+        self._last_table_boxes = table_boxes
+        self._last_yolo_boxes = apple_boxes + table_boxes
+        return apple_boxes
 
     def yolo_boxes(self, img_rgb):
-        """라이브 뷰용: YOLO 전체 탐지 박스 [(name, conf, xyxy)]. 실패 시 []."""
-        if self._yolo is None or img_rgb is None:
-            return []
-        try:
-            res = self._yolo.predict(source=img_rgb[..., ::-1],
-                                     conf=0.15, verbose=False)[0]
-            return [(res.names[int(b.cls)], float(b.conf),
-                     [float(t) for t in b.xyxy[0]]) for b in res.boxes]
-        except Exception:
-            return []
+        """라이브 뷰용: process()에서 계산한 apple/table 박스."""
+        return list(self._last_yolo_boxes)
 
-    def yolo_confirm(self, img_rgb, det):
-        """확정 직전 1회 실행되는 YOLO 검증 게이트.
-
-        후보 블롭 bbox와 30% 이상 겹치는 'apple' 박스가 있어야 통과.
-        ultralytics/모델이 없거나 비활성이면 통과(True).
-        """
-        dcfg = self.cfg.detection
-        if not dcfg.use_yolo or det is None or det.bbox is None \
-                or img_rgb is None:
-            return True
-        if self._yolo is None:
-            if self._yolo_failed:
-                return True
-            try:
-                from ultralytics import YOLO
-                self._yolo = YOLO(dcfg.yolo_model)
-            except Exception as e:
-                print(f"[detection] YOLO 사용 불가({e}) — 게이트 자동 통과")
-                self._yolo_failed = True
-                return True
-        try:
-            res = self._yolo.predict(source=img_rgb[..., ::-1],  # RGB→BGR
-                                     conf=dcfg.yolo_conf, verbose=False)[0]
-        except Exception as e:
-            print(f"[detection] YOLO 추론 실패({e}) — 통과 처리")
-            return True
-        # 베토 모드. 실측 근거: yolo11n은 Webots 저폴리 사과를 'apple'로
-        # 인식하지 못한다(0.9m에서 미탐지) — 양성 확인을 요구하면 진짜
-        # 사과가 기각된다. 대신 블롭과 강하게 겹치는 '비(非)사과' 물체
-        # (캔→vase/tv, 병 등)가 잡히면 디코이로 기각한다.
-        x0, y0, x1, y1 = det.bbox
-        blob_area = max(1, (x1 - x0) * (y1 - y0))
-        for b in res.boxes:
-            name = res.names[int(b.cls)]
-            conf = float(b.conf)
-            bx0, by0, bx1, by1 = [float(t) for t in b.xyxy[0]]
-            iw = min(x1, bx1) - max(x0, bx0)
-            ih = min(y1, by1) - max(y0, by0)
-            if iw <= 0 or ih <= 0 or iw * ih <= 0.4 * blob_area:
-                continue
-            if name == "apple":
-                return True                   # 명시적 사과 확인 → 통과
-            if conf >= 0.30:
-                print(f"[detection] YOLO 베토: '{name}' {conf:.2f}")
-                return False                  # 강한 비사과 물체 → 기각
-        return True
+    def table_boxes(self):
+        """현재 프레임의 확신도 기준을 통과한 dining table 박스."""
+        return list(self._last_table_boxes)
 
     @staticmethod
     def _dominant_blob(mask):
@@ -168,69 +203,96 @@ class TargetDetector:
             mask |= (h >= h_lo) & (h <= h_hi) & (s >= s_lo) & (v >= v_lo)
         return mask
 
+    def _detection_from_mask(self, img_rgb, mask):
+        """빨간색 마스크 하나를 기하 검증하고 Detection으로 변환."""
+        h, w = img_rgb.shape[:2]
+        # 최대 밀집 블롭만 추출 — 화면 곳곳의 반사 노이즈 몇 픽셀이
+        # bbox를 부풀려 채움비·중심 통계를 무너뜨리는 것 방지
+        mask = self._dominant_blob(mask)
+        n = int(mask.sum())
+        if n < self.cfg.detection.min_pixels \
+                or n > self.cfg.detection.max_area_ratio * h * w:
+            return None
+
+        ys, xs = mask.nonzero()
+        cx = float(xs.mean())
+        cx_ratio = cx / w
+        # 핀홀 투영: x_px = f*tan(bearing).
+        import math as _m
+        f_px = (w / 2) / _m.tan(self.cfg.camera.hfov / 2)
+        bearing = _m.atan2(w / 2 - cx, f_px) + self.cfg.camera.mount_yaw
+        ang_left = _m.atan2(w / 2 - float(xs.min()), f_px)
+        ang_right = _m.atan2(w / 2 - float(xs.max() + 1), f_px)
+        ang_width = ang_left - ang_right
+        px_width = int(xs.max() - xs.min() + 1)
+        clipped = bool(xs.min() == 0 or xs.max() == w - 1)
+
+        # 바닥 사과에 맞춘 세로 기하/형태 검증.
+        px_h = int(ys.max() - ys.min() + 1)
+        top_clipped = bool(ys.min() == 0)
+        v_clipped = top_clipped or bool(ys.max() == h - 1)
+        aspect = px_width / max(1, px_h)
+        cy_blob = float(ys.mean())
+        above_horizon = cy_blob < h * 0.35
+        fill = n / max(1, px_width * px_h)
+        if top_clipped or above_horizon:
+            return None
+        if not v_clipped and not (0.35 <= aspect <= 2.4):
+            return None
+        if not v_clipped and not clipped and fill < 0.45:
+            return None
+        return Detection(
+            bearing, n, cx_ratio, (int(ys.min()), int(ys.max())),
+            px_width, ang_width, clipped,
+            bbox=(int(xs.min()), int(ys.min()),
+                  int(xs.max()), int(ys.max())),
+            aspect=aspect, v_clipped=v_clipped, fill=fill,
+        )
+
     def process(self, img_rgb):
-        """img_rgb: (H,W,3) uint8. 반환: Detection 또는 None (이번 프레임)."""
+        """YOLO apple -> HSV red 순서로 한 프레임을 검사."""
         det = None
         if img_rgb is not None:
-            hsv = rgb_to_hsv(img_rgb)
-            mask = self._mask(hsv)
-            n = int(mask.sum())
-            h, w = img_rgb.shape[:2]
-            # 최대 밀집 블롭만 추출 — 화면 곳곳의 반사 노이즈 몇 픽셀이
-            # bbox를 부풀려 채움비·중심 통계를 무너뜨리는 것 방지
-            mask = self._dominant_blob(mask)
-            n = int(mask.sum())
-            if n >= self.cfg.detection.min_pixels \
-                    and n <= self.cfg.detection.max_area_ratio * h * w:
-                ys, xs = mask.nonzero()
-                cx = float(xs.mean())
-                cx_ratio = cx / w
-                # 핀홀 투영: x_px = f*tan(bearing). 선형 근사는 단안 거리를
-                # 중심시야 +10%/가장자리 -17% 편향시킨다 (리뷰 지적 수정)
-                import math as _m
-                f_px = (w / 2) / _m.tan(self.cfg.camera.hfov / 2)
-                bearing = _m.atan2(w / 2 - cx, f_px) \
-                    + self.cfg.camera.mount_yaw
-                ang_left = _m.atan2(w / 2 - float(xs.min()), f_px)
-                ang_right = _m.atan2(w / 2 - float(xs.max() + 1), f_px)
-                ang_width = ang_left - ang_right
-                px_width = int(xs.max() - xs.min() + 1)
-                clipped = bool(xs.min() == 0 or xs.max() == w - 1)
-                # 디코이 방어 (세로 기하):
-                # ① 카메라가 사과 높이에 있으므로 바닥의 사과는 화면
-                #    '상단'에 닿을 수 없다 — 상단 접촉 = 키 큰 물체
-                #    (소화기 등) → 기각. (하단 접촉은 근접 사과에서 정상)
-                # ② 세로로 안 잘린 블롭의 종횡비가 극단이면 기각
-                px_h = int(ys.max() - ys.min() + 1)
-                top_clipped = bool(ys.min() == 0)
-                v_clipped = top_clipped or bool(ys.max() == h - 1)
-                aspect = px_width / max(1, px_h)
-                # ③ 바닥 사과의 블롭 중심은 항상 수평선(화면 중앙 행)
-                #    근처다 (카메라가 사과 높이에 장착). 수평선보다 훨씬
-                #    위에 뜬 블롭 = 공중의 물체(표지판·벽걸이 등) → 기각.
-                #    아래쪽은 근접 사과에서 정상이므로 관대하게.
-                cy_blob = float(ys.mean())
-                above_horizon = cy_blob < h * 0.35
-                # ④ 채움비: 사과(구)는 bbox의 ~78%를 채운다. 표면에 글자·
-                #    무늬가 있는 물체(음료캔 등)는 마스크에 구멍이 남
-                fill = n / max(1, px_width * px_h)
-                # 탐지 단계는 느슨하게 — 가려진 사과(반달형)도 추적해야
-                # SEEK로 접근해 가림을 풀 수 있다. 엄격한 종횡비는
-                # '위치 확정' 단계(state_machine)에서 적용.
-                if top_clipped or above_horizon:
-                    det = None
-                elif not v_clipped and not (0.35 <= aspect <= 2.4):
-                    det = None
-                elif not v_clipped and not clipped and fill < 0.45:
-                    det = None
-                else:
-                    det = Detection(bearing, n, cx_ratio,
-                                    (int(ys.min()), int(ys.max())),
-                                    px_width, ang_width, clipped,
-                                    bbox=(int(xs.min()), int(ys.min()),
-                                          int(xs.max()), int(ys.max())),
-                                    aspect=aspect, v_clipped=v_clipped,
-                                    fill=fill)
+            if self.cfg.detection.use_yolo:
+                # 순서가 중요하다: apple 박스가 하나도 없으면 HSV 계산조차
+                # 하지 않는다. 즉 빨간색 자체는 탐색 후보를 만들 수 없다.
+                apple_boxes = self._predict_apples(img_rgb)
+                red_mask = None
+                if apple_boxes:
+                    red_mask = self._mask(rgb_to_hsv(img_rgb))
+                h, w = img_rgb.shape[:2]
+                best = None
+                best_score = -1.0
+                for _name, conf, (bx0, by0, bx1, by1) \
+                        in apple_boxes:
+                    x0 = max(0, min(w, int(np.floor(bx0))))
+                    y0 = max(0, min(h, int(np.floor(by0))))
+                    x1 = max(0, min(w, int(np.ceil(bx1))))
+                    y1 = max(0, min(h, int(np.ceil(by1))))
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+                    roi = red_mask[y0:y1, x0:x1]
+                    red_pixels = int(roi.sum())
+                    red_ratio = red_pixels / max(1, roi.size)
+                    if red_pixels < self.cfg.detection.min_pixels \
+                            or red_ratio < self.cfg.detection.yolo_red_min_ratio:
+                        continue
+                    candidate_mask = np.zeros_like(red_mask)
+                    candidate_mask[y0:y1, x0:x1] = roi
+                    candidate = self._detection_from_mask(
+                        img_rgb, candidate_mask)
+                    if candidate is None:
+                        continue
+                    score = conf * candidate.pixels
+                    if score > best_score:
+                        best, best_score = candidate, score
+                det = best
+            else:
+                # 단위/오프라인 테스트 및 긴급 폴백용 HSV-only 모드.
+                self._last_yolo_boxes = []
+                self._last_table_boxes = []
+                red_mask = self._mask(rgb_to_hsv(img_rgb))
+                det = self._detection_from_mask(img_rgb, red_mask)
 
         if det is not None:
             self.consecutive += 1

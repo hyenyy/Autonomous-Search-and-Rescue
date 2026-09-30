@@ -18,6 +18,9 @@ class OccupancyGrid:
         self.origin_x = center_xy[0] - m.half_size
         self.origin_y = center_xy[1] - m.half_size
         self.log = np.zeros((self.n, self.n), dtype=np.float32)
+        # 카메라 의미 인식으로 보강한 정적 장애물. log-odds와 분리해
+        # 이후 LiDAR free ray가 테이블 다리 사이를 다시 지우지 못하게 한다.
+        self.virtual_occupied = np.zeros((self.n, self.n), dtype=bool)
         self.l_occ = m.l_occ
         self.l_free = m.l_free
         self.l_clamp = m.l_clamp
@@ -104,13 +107,14 @@ class OccupancyGrid:
 
     # ── 조회 ──────────────────────────────────────────────────
     def occupied_mask(self):
-        return self.log > self.occ_th
+        return (self.log > self.occ_th) | self.virtual_occupied
 
     def free_mask(self):
-        return self.log < self.free_th
+        return (self.log < self.free_th) & ~self.virtual_occupied
 
     def unknown_mask(self):
-        return (self.log >= self.free_th) & (self.log <= self.occ_th)
+        return (self.log >= self.free_th) & (self.log <= self.occ_th) \
+            & ~self.virtual_occupied
 
     def inflated_mask(self, radius_m):
         """장애물을 radius_m 만큼 팽창한 통행불가 마스크 (버전 캐시)."""
@@ -133,6 +137,45 @@ class OccupancyGrid:
                 out |= shifted
         self._inflate_cache = (key, out)
         return out
+
+    def mark_virtual_segment(self, p0, p1, thickness_m):
+        """월드 좌표 선분 주변을 영구 가상 장애물로 표시한다.
+
+        테이블의 앞쪽 두 다리를 연결해 '들어갈 수 있는 틈'이 아니라
+        '돌아가야 하는 가장자리'로 보이게 한다. 선분 끝 바깥은 열려 있어
+        테이블 뒤 공간은 계속 탐색할 수 있다.
+        """
+        x0, y0 = p0
+        x1, y1 = p1
+        pad = max(float(thickness_m), self.res)
+        ix0, iy0 = self.world_to_grid(min(x0, x1) - pad,
+                                      min(y0, y1) - pad)
+        ix1, iy1 = self.world_to_grid(max(x0, x1) + pad,
+                                      max(y0, y1) + pad)
+        ix0, iy0 = max(0, ix0), max(0, iy0)
+        ix1, iy1 = min(self.n - 1, ix1), min(self.n - 1, iy1)
+        if ix0 > ix1 or iy0 > iy1:
+            return 0
+
+        xs = self.origin_x + (np.arange(ix0, ix1 + 1) + 0.5) * self.res
+        ys = self.origin_y + (np.arange(iy0, iy1 + 1) + 0.5) * self.res
+        xx, yy = np.meshgrid(xs, ys)
+        vx, vy = x1 - x0, y1 - y0
+        denom = vx * vx + vy * vy
+        if denom <= 1e-12:
+            d2 = (xx - x0) ** 2 + (yy - y0) ** 2
+        else:
+            t = np.clip(((xx - x0) * vx + (yy - y0) * vy) / denom,
+                        0.0, 1.0)
+            d2 = (xx - (x0 + t * vx)) ** 2 + (yy - (y0 + t * vy)) ** 2
+        local = d2 <= pad * pad
+        view = self.virtual_occupied[iy0:iy1 + 1, ix0:ix1 + 1]
+        added = int(np.count_nonzero(local & ~view))
+        if added:
+            view |= local
+            self._version += 1
+            self._inflate_cache = None
+        return added
 
     def frontier_mask(self):
         """빈공간 셀 중 미지 셀과 4-이웃으로 접한 셀."""

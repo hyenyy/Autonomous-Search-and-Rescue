@@ -13,8 +13,11 @@ from sar.geometry import bresenham, wrap_angle
 from sar.mapping import OccupancyGrid
 from sar.odometry import DiffDriveOdometry, PoseEstimator
 from sar.breadcrumbs import Breadcrumbs
+from sar.energy import EnergyManager
 from sar.exploration import FrontierExplorer
 from sar.planning import astar, simplify_path
+from sar.semantic_obstacles import TableObstacleMapper
+from sar.state_machine import Mission
 
 
 def test_wrap_angle():
@@ -142,6 +145,134 @@ def test_detection_decoy_rejection():
     assert det4.process(img4) is None
 
 
+class _FakeYoloBox:
+    def __init__(self, class_id, confidence, xyxy):
+        self.cls = np.array([class_id], dtype=np.float32)
+        self.conf = np.array([confidence], dtype=np.float32)
+        self.xyxy = np.array([xyxy], dtype=np.float32)
+
+
+class _FakeYoloResult:
+    def __init__(self, boxes):
+        self.boxes = boxes
+        self.names = {47: "apple", 49: "orange", 60: "dining table"}
+
+
+class _FakeYoloModel:
+    def __init__(self, boxes):
+        self.boxes = boxes
+        self.calls = []
+
+    def predict(self, **kwargs):
+        self.calls.append(kwargs)
+        return [_FakeYoloResult(self.boxes)]
+
+
+def test_detection_yolo_apple_then_red_passes():
+    """YOLO apple 박스가 먼저 나오고, 내부가 빨간 경우에만 통과한다."""
+    cfg = default_config()
+    cfg.detection.use_yolo = True
+    detector = TargetDetector(cfg)
+    model = _FakeYoloModel([
+        _FakeYoloBox(47, 0.91, [70, 45, 100, 75]),
+    ])
+    detector._yolo = model
+
+    img = np.full((120, 160, 3), 100, dtype=np.uint8)
+    img[50:70, 75:95] = (210, 20, 20)
+    detection = None
+    for _ in range(cfg.detection.confirm_frames):
+        detection = detector.process(img)
+
+    assert detection is not None
+    assert detector.confirmed
+    assert model.calls
+    assert model.calls[-1]["classes"] == [47, 60]
+    assert detector.yolo_boxes(img)[0][0] == "apple"
+
+
+def test_detection_yolo_apple_without_red_fails():
+    """YOLO가 apple이라 해도 HSV 빨강 검증을 못 넘으면 최종 기각한다."""
+    cfg = default_config()
+    cfg.detection.use_yolo = True
+    detector = TargetDetector(cfg)
+    detector._yolo = _FakeYoloModel([
+        _FakeYoloBox(47, 0.91, [70, 45, 100, 75]),
+    ])
+
+    img = np.full((120, 160, 3), 100, dtype=np.uint8)
+    img[50:70, 75:95] = (20, 210, 20)
+    assert detector.process(img) is None
+    assert not detector.confirmed
+
+
+def test_detection_exposes_table_from_same_yolo_pass():
+    """apple과 table은 별도 추론하지 않고 한 번의 YOLO 결과에서 나눈다."""
+    cfg = default_config()
+    cfg.detection.use_yolo = True
+    detector = TargetDetector(cfg)
+    model = _FakeYoloModel([
+        _FakeYoloBox(60, 0.82, [35, 20, 125, 105]),
+    ])
+    detector._yolo = model
+    img = np.full((120, 160, 3), 100, dtype=np.uint8)
+
+    assert detector.process(img) is None
+    assert len(model.calls) == 1
+    assert model.calls[0]["classes"] == [47, 60]
+    tables = detector.table_boxes()
+    assert len(tables) == 1 and tables[0][0] == "dining table"
+
+
+def test_table_mapper_bridges_legs_but_keeps_back_reachable():
+    """테이블 다리 사이는 막되 선분 끝으로 돌아 뒤쪽에 갈 수 있어야 한다."""
+    cfg = default_config()
+    cfg.map.half_size = 3.0
+    grid = OccupancyGrid(cfg, (0.0, 0.0))
+    mapper = TableObstacleMapper(cfg, grid)
+    angles = np.linspace(-math.pi, math.pi, 721)
+    ranges = np.full(angles.shape, cfg.lidar.max_range)
+    # 카메라 테이블 박스 안, 약 1m 앞의 좌우 다리 두 개.
+    ranges[np.abs(angles - 0.20) < 0.018] = 1.0
+    ranges[np.abs(angles + 0.20) < 0.018] = 1.0
+    boxes = [("dining table", 0.85, [40, 15, 120, 110])]
+
+    added = 0
+    for i in range(cfg.table.confirm_frames):
+        added += mapper.update(i * 0.1, (0.0, 0.0, 0.0),
+                               angles, ranges, 160, boxes)
+    assert added > 0
+    mid = grid.world_to_grid(1.0, 0.0)
+    assert grid.virtual_occupied[mid[1], mid[0]], "다리 사이가 막혀야"
+    behind = grid.world_to_grid(1.6, 0.0)
+    assert not grid.virtual_occupied[behind[1], behind[0]], \
+        "테이블 뒤쪽 전체를 막으면 안 됨"
+
+    blocked = grid.inflated_mask(
+        cfg.robot.robot_radius + cfg.plan.inflate_margin)
+    unknown = np.zeros_like(blocked)
+    start = grid.world_to_grid(0.0, 0.0)
+    goal = grid.world_to_grid(1.6, 0.0)
+    path = astar(blocked, unknown, start, goal)
+    assert path is not None, "테이블 옆으로 돌아 뒤쪽에 도달 가능해야"
+    world_path = [grid.grid_to_world(ix, iy) for ix, iy in path]
+    assert max(abs(y) for _, y in world_path) > 0.35
+
+
+def test_recovery_does_not_reverse_into_table_leg():
+    cfg = default_config()
+    grid = OccupancyGrid(cfg, (0.0, 0.0))
+    mission = Mission(cfg, grid)
+    angles = np.linspace(-math.pi, math.pi, 361)
+    ranges = np.full(angles.shape, cfg.lidar.max_range)
+    ranges[0] = 0.20                 # 정후방 다리
+    mission._recover_phase = ("backup", 0.0)
+
+    v, w = mission._do_recover(0.1, (0.0, 0.0, 0.0), angles, ranges)
+    assert v == 0.0 and w == 0.0
+    assert mission._recover_phase[0] == "spin"
+
+
 def test_estimate_target_position():
     angles = np.linspace(-math.pi, math.pi, 360, endpoint=False)
     ranges = np.full(360, 3.0)
@@ -166,6 +297,23 @@ def test_breadcrumbs():
     assert len(path) >= 2
     assert path[0][0] >= path[-1][0], "복귀 경로는 뒤로 향해야"
     assert abs(path[-1][0]) < 0.01, "복귀 경로 끝 = 시작점"
+
+
+def test_energy_aware_return():
+    cfg = default_config()
+    cfg.energy.initial_percent = 20.0
+    cfg.energy.reserve_percent = 10.0
+    cfg.energy.percent_per_meter = 1.0
+    cfg.energy.return_multiplier = 1.0
+    bc = Breadcrumbs(cfg)
+    for i in range(6):
+        bc.record((float(i), 0.0, 0.0))
+    energy = EnergyManager(cfg)
+    energy.update((0.0, 0.0, 0.0))
+    energy.update((5.0, 0.0, 0.0))
+    # 5%를 주행에 사용해 15%가 남고, 귀환 5% + reserve 10%가 필요하다.
+    assert abs(energy.percent - 15.0) < 1e-9
+    assert energy.should_return((5.0, 0.0, 0.0), bc)
 
 
 def test_frontier_explorer():
