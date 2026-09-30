@@ -102,10 +102,18 @@
       const p = s.pose;
       const timings = Object.entries(s.stage_ms || {}).map(([k,v]) => k + ': ' + v.toFixed(1) + 'ms').join(' · ');
       const objects = (s.objects || []).map(o => o.name + ' ' + Math.round(o.confidence * 100) + '%').join(', ') || '없음';
+      const rejectionLabels = {too_few_color_pixels_or_fragmented:'색상 픽셀 부족 또는 작은 조각',
+        top_clipped_or_above_horizon:'화면 상단 잘림 또는 높이 조건', aspect_ratio:'모양 비율',
+        low_color_fill:'색상 채움비 부족', no_frame:'카메라 영상 대기'};
+      const detection = s.detection_status;
+      const detectionText = !detection ? '진단 정보 없음' : detection.visible ?
+        (detection.position_valid ? '색상 후보 관측 · 위치 추정 유효' : '색상 후보 관측 · 위치 확정 조건 미충족') :
+        '후보 없음 · ' + (rejectionLabels[detection.rejection] || detection.rejection || '미탐지');
       put('details', s.error ? s.error : p ?
         `추정 위치 x=${p[0].toFixed(2)}m, y=${p[1].toFixed(2)}m · 방향 ${(p[2]*180/Math.PI).toFixed(1)}°\n` +
         `시뮬레이션 ${s.sim_time.toFixed(1)}s · 관측한 면적 ${s.known_area_m2.toFixed(1)}m² · 복귀 경로 ${s.return_method}\n` +
         `현재 영상 객체: ${objects}\n` +
+        `목표 탐지: ${detectionText} · 회피 상태: ${s.avoidance_mode || '정보 없음'}\n` +
         `YOLO 전처리~결과 수신 ${s.yolo_ms?.toFixed(1) ?? '—'}ms · ${s.hsv_backend}\n` +
         `현재 실행 위치 추정: ${s.localization || '정보 없음'}\n` +
         `제어 1회 평균: ${timings}` : '모델과 센서 준비 중…');

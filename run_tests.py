@@ -183,7 +183,8 @@ def test_frontier_explorer():
     ix, iy = grid.world_to_grid(*target)
     assert abs(ix - half) <= 2, "frontier는 free/unknown 경계 근처여야"
     # 관성: 같은 목표 유지
-    t2 = ex.update((0.1, 0.1))
+    # Check hysteresis before arrival; a reached boundary must advance to a new goal.
+    t2 = ex.update((-0.5, 0.0))
     assert t2 == target
 
 

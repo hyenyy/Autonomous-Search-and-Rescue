@@ -92,8 +92,8 @@ class PoseEstimator:
             heading = wrap_angle(compass_raw + self._compass_offset)
         return self.odom.update(left_pos, right_pos, heading=heading)
 
-    def correct_with_scan(self, grid, angles, ranges):
-        if self.matcher is not None:
+    def correct_with_scan(self, grid, angles, ranges, commanded_v=None):
+        if self.matcher is not None and (commanded_v is None or abs(commanded_v) > .005):
             self.odom.x, self.odom.y, _ = self.matcher.match(
                 grid, self.pose, angles, ranges)
         return self.pose

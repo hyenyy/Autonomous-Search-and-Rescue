@@ -59,6 +59,7 @@ class Mission:
         self.target_found = False    # '현재' 목표 확정 여부
         self._target_anchor = None
         self._target_seen_t = 0.0
+        self._target_tracking_valid = False
         self.target_reached = False  # '모든' 목표 방문 완료 여부
 
         # 지도 우선 전략: 탐사 중 목표는 후보로만 기억 → 지도 완성 후 방문
@@ -210,16 +211,22 @@ class Mission:
             if width < 0.22:                 # 로봇이 못 지나갈 좁은 구간
                 continue
             ii = (np.arange(s, e) + off) % n
-            depth = float(np.median(r[ii]))
-            phi = float(a[ii[len(ii) // 2]])     # run 한가운데 방향
-            score = min(depth, 1.5) + 0.35 * min(width, 1.5) \
-                - 0.06 * abs(phi)
-            # 목표 방향 보너스는 '깊은' 구간에만 — 얕은 코너 구간이 벽
-            # 너머 목표 방향이라는 이유로 진짜 틈을 이기면 안 된다
-            if g_ang is not None and depth > 1.0:
-                score += 0.5 * math.cos(wrap_angle(pose[2] + phi - g_ang))
-            if score > best:
-                best, best_phi = score, phi
+            # The middle free ray is not necessarily a passable direction for
+            # a finite-radius robot. Score swept-circle clearance at each ray;
+            # nearby doorposts must constrain even a long-range center ray.
+            radius = self.cfg.robot.robot_radius + .015
+            for index in ii:
+                phi = float(a[index])
+                forward = r * np.cos(a - phi)
+                lateral = r * np.sin(a - phi)
+                corridor = (forward > 0) & (np.abs(lateral) < radius)
+                depth = float(np.min(forward[corridor] - np.sqrt(
+                    radius ** 2 - lateral[corridor] ** 2))) if corridor.any() else 3.0
+                score = min(depth, 1.5) + 0.35 * min(width, 1.5) - 0.06 * abs(phi)
+                if g_ang is not None and depth > 1.0:
+                    score += 0.5 * math.cos(wrap_angle(pose[2] + phi - g_ang))
+                if score > best:
+                    best, best_phi = score, phi
         if best_phi is None:
             best_phi = float(a[int(np.argmax(r))])
         return wrap_angle(pose[2] + best_phi)
@@ -290,6 +297,7 @@ class Mission:
         r_v = self.cfg.mission.visited_radius
         if any(dist(accepted, vt) < r_v for vt in self.visited_targets):
             return
+        self._target_tracking_valid = True
 
         # 지도 우선 모드: 모든 유효 추정을 '후보'로 기억 (원거리 포함 —
         # ±25% 오차라도 VISIT가 가서 확인할 예상 위치로는 충분)
@@ -451,13 +459,14 @@ class Mission:
             near_wall |= g.log[sy + dy, sx + dx] \
                 > self.cfg.plan.dyn_wall_logodds
         dyn[sel] = was_free & ~near_wall
-        # 위치 연속성: 직전 사람 위치 주변에 찍힌 빔은 셀 상태와 무관하게
-        # 동적 취급 — 부분 분류 → 지도 오염 → 분류 붕괴 악순환을 끊는다
+        # Keep a person's partial returns together, but never let track
+        # proximity turn confirmed furniture/walls into a moving obstacle.
         if self.planner.avoid_xy is not None:
             ax, ay = self.planner.avoid_xy
             near_p = (ex[inb] - ax) ** 2 + (ey[inb] - ay) ** 2 \
                 < self.cfg.plan.dyn_track_radius ** 2
-            dyn[sel] |= near_p
+            static = near_wall | (g.log[sy, sx] > self.cfg.plan.dyn_wall_logodds)
+            dyn[sel] |= near_p & ~static
         return dyn
 
     def _update_person_est(self, now, pose, angles, ranges, dyn):
@@ -475,6 +484,7 @@ class Mission:
             ca, sa = np.cos(a), np.sin(a)
             spread = 1.0 - math.hypot(float(ca.mean()), float(sa.mean()))
             if spread > 0.12:      # ±약 30도 이상 흩어짐 → 기각
+                dyn[:] = False  # The same mask feeds mapping and emergency avoidance.
                 if now - getattr(self, "_person_seen_t", -1e9) > 2.0:
                     self.planner.avoid_xy = None
                     self.planner.avoid_vel = None
@@ -494,10 +504,12 @@ class Mission:
                 span = math.hypot(max(p[1] for p in ph) - min(p[1] for p in ph),
                                   max(p[2] for p in ph) - min(p[2] for p in ph))
                 if span < 0.12:
+                    dyn[:] = False
                     self.planner.avoid_xy = None
                     self.planner.avoid_vel = None
                     self._person_hist = []
-                    self._phantom_hist = []
+                    # Retain the stationary evidence: clearing it rearms the
+                    # same furniture as a moving person on the very next tick.
                     return
             self.planner.avoid_xy = (cx, cy)
             self._person_seen_t = now
@@ -554,7 +566,9 @@ class Mission:
         # 오염시켜 crumb 폴백이 꼬리를 무는 것 방지)
         if self.state not in (self.RETURN, self.DONE):
             self.crumbs.record(pose)
+            self.explorer.observe_pose(pose)
         self.detector.process(camera_img)
+        self._target_tracking_valid = False
         valid_estimate = False
         if self.detector.visible and self.state not in (self.RETURN, self.DONE):
             valid_estimate = bool(self._update_target_estimate(pose, angles, ranges))
@@ -606,6 +620,7 @@ class Mission:
         elif not self.target_found and not self.target_reached \
                 and not self._map_first_active \
                 and self.detector.confirmed \
+                and self.detector.visible and self._target_tracking_valid \
                 and now > self._seek_block_until \
                 and self.detector.last is not None \
                 and not self._looking_at_visited(
@@ -645,8 +660,7 @@ class Mission:
                           f"벽 추종으로 패턴 파괴")
                     self._region_escape_cd = now + 90.0
                     self._region_hist.clear()
-                    self.explorer.blacklist.clear()
-                    self.explorer.current_target = None
+                    self.explorer.fail_current()
                     self._wf_escape_until = now + 40.0
                     self._wf_anchor = None
                     self._enter(self.WALL_FOLLOW, now)
@@ -783,6 +797,12 @@ class Mission:
             "start": self.start_xy,
             "distance_to_start": dist(pose, self.start_xy),
             "dyn_count": int(dyn.sum()) if dyn is not None else 0,
+            "avoidance_mode": self.avoider.last_mode,
+            "person_xy": self.planner.avoid_xy,
+            "person_velocity": self.planner.avoid_vel,
+            "detection_status": {"visible": self.detector.visible,
+                                 "rejection": self.detector.rejection_reason,
+                                 "position_valid": valid_estimate},
             "target_est": self.target_est,
             "goal": self.planner.goal,
             "waypoints": list(self.planner.waypoints),
@@ -1074,6 +1094,10 @@ class Mission:
         if not self.detector.confirmed or self.detector.last is None:
             self._enter(self.EXPLORE, now)   # 시야 상실 → 탐색 재개
             return 0.0, 0.0
+        if self.detector.visible and not self._target_tracking_valid:
+            self._seek_block_until = now + 5.0
+            self._enter(self.EXPLORE, now)
+            return 0.0, 0.0
         # 시간 상한: 위치 확정이 계속 안 되는 대상(방문한 사과·원거리 디코이)
         # 을 무한 응시하지 않는다
         if now - self.state_since > 25.0:
@@ -1246,6 +1270,16 @@ class Mission:
         okb = np.isfinite(rr_) & (rr_ > 0.05)
         fwd = rr_[okb] * np.cos(aa[okb])
         lat = rr_[okb] * np.sin(aa[okb])
+        # The narrow front sector misses a table leg beside the nose. Check the
+        # full swept footprint before creeping, while leaving passable side gaps.
+        radius = cfg.robot.robot_radius + .015
+        corridor = (fwd > 0) & (np.abs(lat) < radius)
+        contact_distance = float('inf')
+        if corridor.any():
+            # Distance until a translated circular footprint touches each hit.
+            # A rectangular front guard falsely blocks passable doorway corners.
+            contact_distance = float(np.min(
+                fwd[corridor] - np.sqrt(radius ** 2 - lat[corridor] ** 2)))
         near = (fwd > 0.0) & (fwd < 0.45) & (np.abs(lat) < 0.4)
         lsel = near & (lat > 0)
         rsel = near & (lat < 0)
@@ -1253,7 +1287,7 @@ class Mission:
         r_lat = float((-lat[rsel]).min()) if rsel.any() else 0.4
         flanked = min(l_lat, r_lat) < 0.30
         max_d = 1.0 if flanked else 0.55
-        if front < 0.16 or creeped > max_d or now - t0 > 9.0:
+        if front < 0.16 or contact_distance < .035 or creeped > max_d or now - t0 > 9.0:
             return self._finish_recover(now, pose)
         err = wrap_angle(math.atan2(self._creep_goal[1] - pose[1],
                                     self._creep_goal[0] - pose[0]) - pose[2])

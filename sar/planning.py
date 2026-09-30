@@ -425,6 +425,9 @@ class LocalAvoider:
         self.relax_until = -1e9      # 이 시각까지 안전 마진 일시 완화
                                      # (갇힘 탈출 직후·소프트 경로 추종 중)
         self._esc_latch = None       # (world_ang, until) 탈출 방향 래치
+        self._static_escape = None   # (start time, latched turn sign)
+        self._static_clear_since = None
+        self._static_replan_at = -1e9
 
     def _dyn_trend(self, now, d_min):
         """(approaching, receding): 0.6s 창에서의 거리 추세."""
@@ -698,6 +701,49 @@ class LocalAvoider:
             else cfg.plan.danger_dist
         corr_m = 0.02 if relaxed else cfg.plan.corridor_margin
         lat_m = 0.03 if relaxed else 0.05
+
+        # Static furniture escape is a maneuver, not a new decision per beam.
+        # Keep direction across nearest-leg/threshold noise; back up only briefly,
+        # then turn in place until the forward corridor is consistently clear.
+        if dyn_action is not None:
+            self._static_escape = None  # Moving threats retain their own policy.
+            self._static_clear_since = None
+        else:
+            front_close = (r < danger_d) & (forward > 0) & (np.abs(lateral) < rr + lat_m)
+            if self._static_escape is None and v > .02 and front_close.any():
+                nearest = int(np.argmin(np.where(front_close, r, np.inf)))
+                turn = math.copysign(1.0, w) if abs(w) > .1 else -math.copysign(1.0, a[nearest])
+                self._static_escape = (now, turn)
+                self._static_clear_since = None
+                self._static_replan_at = now + cfg.plan.static_wait
+            if self._static_escape is not None:
+                started, turn = self._static_escape
+                corridor = (forward > .02) & (np.abs(lateral) < rr + corr_m)
+                front = float(forward[corridor].min()) if corridor.any() else float('inf')
+                if front > max(.30, stop_d * 1.5):
+                    if self._static_clear_since is None:
+                        self._static_clear_since = now
+                else:
+                    self._static_clear_since = None
+                if self._static_clear_since is not None and now - self._static_clear_since >= .3:
+                    self._static_escape = None
+                    self._stopped = False
+                    self._stop_turn = None
+                    self._front_hist.clear()
+                else:
+                    self.last_mode = 'static_escape'
+                    rear_corridor = (forward < -.02) & (np.abs(lateral) < rr + corr_m)
+                    rear = float((-forward[rear_corridor]).min()) if rear_corridor.any() else float('inf')
+                    backup = now - started < .6 and front_close.any() and rear > .25
+                    replan = now >= self._static_replan_at
+                    if replan:
+                        self._static_replan_at = now + cfg.plan.static_wait
+                    return (-.08 if backup else 0.0), turn * cfg.robot.max_w * .4, replan
+            # A stationary circular robot can follow its intended scan/alignment
+            # rotation; a front stop must not overwrite it with an opposite turn.
+            if abs(v) < 1e-6:
+                self.last_mode = 'rotate'
+                return v, w, blocked_long
 
         # 1a) 비상: 반경 danger_dist 안 + 로봇 폭에 실제로 걸치는 물체.
         #     단, 전진하지 않는 제자리 회전은 원형 로봇에겐 접촉 불가 —

@@ -64,6 +64,7 @@ class TargetDetector:
         self.miss = 0
         self.confirmed = False
         self.last = None              # 마지막 Detection
+        self.rejection_reason = 'no_frame'
         self._yolo = None
         self._yolo_failed = False
         self.yolo_device = "disabled"
@@ -159,6 +160,9 @@ class TargetDetector:
                 return True                   # 명시적 사과 확인 → 통과
             if name in dcfg.yolo_ambiguous_classes:
                 continue  # Webots apple was measured as sports ball; HSV/geometry still required.
+            object_area = max(1, (bx1 - bx0) * (by1 - by0))
+            if iw * ih < .15 * object_area:
+                continue  # A large background couch/table is not this small red blob.
             if conf >= 0.30:
                 print(f"[detection] YOLO 베토: '{name}' {conf:.2f}")
                 return False                  # 강한 비사과 물체 → 기각
@@ -203,71 +207,90 @@ class TargetDetector:
             mask |= (h >= h_lo) & (h <= h_hi) & (s >= s_lo) & (v >= v_lo)
         return mask
 
+    def _candidate_masks(self, mask):
+        if cv2 is None:
+            yield self._dominant_blob(mask)
+            return
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask.astype(np.uint8), connectivity=8)
+        candidates = [i for i in range(1, count)
+                      if stats[i, cv2.CC_STAT_AREA] >= self.cfg.detection.min_pixels]
+        # Examine distinct objects separately: a rejected red sign must not hide
+        # a smaller apple elsewhere in the frame. Bound cost on noisy images.
+        candidates.sort(key=lambda i: stats[i, cv2.CC_STAT_AREA], reverse=True)
+        for i in candidates[:12]:
+            yield labels == i
+
     def process(self, img_rgb):
         """img_rgb: (H,W,3) uint8. 반환: Detection 또는 None (이번 프레임)."""
         det = None
+        self.rejection_reason = 'no_frame'
         if img_rgb is not None:
             hsv = rgb_to_hsv(img_rgb)
             mask = self._mask(hsv)
-            n = int(mask.sum())
+            self.rejection_reason = 'too_few_color_pixels_or_fragmented'
             h, w = img_rgb.shape[:2]
-            # 최대 밀집 블롭만 추출 — 화면 곳곳의 반사 노이즈 몇 픽셀이
-            # bbox를 부풀려 채움비·중심 통계를 무너뜨리는 것 방지
-            mask = self._dominant_blob(mask)
-            n = int(mask.sum())
-            if n >= self.cfg.detection.min_pixels \
-                    and n <= self.cfg.detection.max_area_ratio * h * w:
-                ys, xs = mask.nonzero()
-                cx = float(xs.mean())
-                cx_ratio = cx / w
-                # 핀홀 투영: x_px = f*tan(bearing). 선형 근사는 단안 거리를
-                # 중심시야 +10%/가장자리 -17% 편향시킨다 (리뷰 지적 수정)
-                import math as _m
-                f_px = (w / 2) / _m.tan(self.cfg.camera.hfov / 2)
-                bearing = _m.atan2(w / 2 - cx, f_px) \
-                    + self.cfg.camera.mount_yaw
-                ang_left = _m.atan2(w / 2 - float(xs.min()), f_px)
-                ang_right = _m.atan2(w / 2 - float(xs.max() + 1), f_px)
-                ang_width = ang_left - ang_right
-                px_width = int(xs.max() - xs.min() + 1)
-                clipped = bool(xs.min() == 0 or xs.max() == w - 1)
-                # 디코이 방어 (세로 기하):
-                # ① 카메라가 사과 높이에 있으므로 바닥의 사과는 화면
-                #    '상단'에 닿을 수 없다 — 상단 접촉 = 키 큰 물체
-                #    (소화기 등) → 기각. (하단 접촉은 근접 사과에서 정상)
-                # ② 세로로 안 잘린 블롭의 종횡비가 극단이면 기각
-                px_h = int(ys.max() - ys.min() + 1)
-                top_clipped = bool(ys.min() == 0)
-                v_clipped = top_clipped or bool(ys.max() == h - 1)
-                aspect = px_width / max(1, px_h)
-                # ③ 바닥 사과의 블롭 중심은 항상 수평선(화면 중앙 행)
-                #    근처다 (카메라가 사과 높이에 장착). 수평선보다 훨씬
-                #    위에 뜬 블롭 = 공중의 물체(표지판·벽걸이 등) → 기각.
-                #    아래쪽은 근접 사과에서 정상이므로 관대하게.
-                cy_blob = float(ys.mean())
-                above_horizon = cy_blob < h * self.cfg.detection.min_center_y_ratio
-                # ④ 채움비: 사과(구)는 bbox의 ~78%를 채운다. 표면에 글자·
-                #    무늬가 있는 물체(음료캔 등)는 마스크에 구멍이 남
-                fill = n / max(1, px_width * px_h)
-                # 탐지 단계는 느슨하게 — 가려진 사과(반달형)도 추적해야
-                # SEEK로 접근해 가림을 풀 수 있다. 엄격한 종횡비는
-                # '위치 확정' 단계(state_machine)에서 적용.
-                if top_clipped or above_horizon:
-                    det = None
-                elif not v_clipped and not (0.35 <= aspect <= 2.4):
-                    det = None
-                elif not v_clipped and not clipped and fill < 0.45:
-                    det = None
-                else:
-                    det = Detection(bearing, n, cx_ratio,
-                                    (int(ys.min()), int(ys.max())),
-                                    px_width, ang_width, clipped,
-                                    bbox=(int(xs.min()), int(ys.min()),
-                                          int(xs.max()), int(ys.max())),
-                                    aspect=aspect, v_clipped=v_clipped,
-                                    fill=fill)
+            for mask in self._candidate_masks(mask):
+                n = int(mask.sum())
+                if n >= self.cfg.detection.min_pixels \
+                        and n <= self.cfg.detection.max_area_ratio * h * w:
+                    ys, xs = mask.nonzero()
+                    cx = float(xs.mean())
+                    cx_ratio = cx / w
+                    # 핀홀 투영: x_px = f*tan(bearing). 선형 근사는 단안 거리를
+                    # 중심시야 +10%/가장자리 -17% 편향시킨다 (리뷰 지적 수정)
+                    import math as _m
+                    f_px = (w / 2) / _m.tan(self.cfg.camera.hfov / 2)
+                    bearing = _m.atan2(w / 2 - cx, f_px) \
+                        + self.cfg.camera.mount_yaw
+                    ang_left = _m.atan2(w / 2 - float(xs.min()), f_px)
+                    ang_right = _m.atan2(w / 2 - float(xs.max() + 1), f_px)
+                    ang_width = ang_left - ang_right
+                    px_width = int(xs.max() - xs.min() + 1)
+                    clipped = bool(xs.min() == 0 or xs.max() == w - 1)
+                    # 디코이 방어 (세로 기하):
+                    # ① 카메라가 사과 높이에 있으므로 바닥의 사과는 화면
+                    #    '상단'에 닿을 수 없다 — 상단 접촉 = 키 큰 물체
+                    #    (소화기 등) → 기각. (하단 접촉은 근접 사과에서 정상)
+                    # ② 세로로 안 잘린 블롭의 종횡비가 극단이면 기각
+                    px_h = int(ys.max() - ys.min() + 1)
+                    top_clipped = bool(ys.min() == 0)
+                    v_clipped = top_clipped or bool(ys.max() == h - 1)
+                    aspect = px_width / max(1, px_h)
+                    # ③ 바닥 사과의 블롭 중심은 항상 수평선(화면 중앙 행)
+                    #    근처다 (카메라가 사과 높이에 장착). 수평선보다 훨씬
+                    #    위에 뜬 블롭 = 공중의 물체(표지판·벽걸이 등) → 기각.
+                    #    아래쪽은 근접 사과에서 정상이므로 관대하게.
+                    cy_blob = float(ys.mean())
+                    above_horizon = cy_blob < h * self.cfg.detection.min_center_y_ratio
+                    # ④ 채움비: 사과(구)는 bbox의 ~78%를 채운다. 표면에 글자·
+                    #    무늬가 있는 물체(음료캔 등)는 마스크에 구멍이 남
+                    fill = n / max(1, px_width * px_h)
+                    # 탐지 단계는 느슨하게 — 가려진 사과(반달형)도 추적해야
+                    # SEEK로 접근해 가림을 풀 수 있다. 엄격한 종횡비는
+                    # '위치 확정' 단계(state_machine)에서 적용.
+                    if top_clipped or above_horizon:
+                        self.rejection_reason = 'top_clipped_or_above_horizon'
+                        det = None
+                    elif not v_clipped and not (0.35 <= aspect <= 2.4):
+                        self.rejection_reason = 'aspect_ratio'
+                        det = None
+                    elif not v_clipped and not clipped and fill < 0.45:
+                        self.rejection_reason = 'low_color_fill'
+                        det = None
+                    else:
+                        det = Detection(bearing, n, cx_ratio,
+                                        (int(ys.min()), int(ys.max())),
+                                        px_width, ang_width, clipped,
+                                        bbox=(int(xs.min()), int(ys.min()),
+                                              int(xs.max()), int(ys.max())),
+                                        aspect=aspect, v_clipped=v_clipped,
+                                        fill=fill)
+                if det is not None:
+                    break
 
         if det is not None:
+            self.rejection_reason = None
             self.consecutive += 1
             self.miss = 0
             self.last = det

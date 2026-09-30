@@ -4,6 +4,7 @@ import math
 import os
 from pathlib import Path
 import sys
+from collections import deque
 
 from controller import Supervisor
 
@@ -25,9 +26,11 @@ def main():
     last = -1
     min_upright = 1.0
     done_since = None
+    truth = deque(maxlen=500)
     while robot.step(timestep) != -1:
         now = robot.getTime()
         p = target.getPosition()
+        truth.append((now, p[:]))
         orientation = target.getOrientation()
         min_upright = min(min_upright, orientation[8])
         for i, apple in enumerate(apples):
@@ -42,13 +45,17 @@ def main():
             status = {}
         home = math.hypot(p[0] - start[0], p[1] - start[1])
         pose = status.get('pose')
-        report = dict(sim_time=now, true_position=p, home_distance=home,
+        sample = min(truth, key=lambda row: abs(row[0] - status.get('sim_time', now)))
+        synced = pose is not None and abs(sample[0] - status.get('sim_time', now)) < .1
+        report = dict(sim_time=now, run_id=status.get('run_id'), true_position=p, home_distance=home,
                       min_target_distances=mins, min_upright=min_upright,
                       current_upright=orientation[8], controller_state=status.get('state'),
                       controller_success=status.get('success', False),
                       visited=status.get('visited', 0),
-                      pose_error=math.hypot(p[0]-pose[0], p[1]-pose[1]) if pose else None)
+                      pose_error=math.hypot(sample[1][0]-pose[0], sample[1][1]-pose[1]) if synced else None)
         write_json(out / 'ground_truth.json', report)
+        with (out / 'ground_truth.jsonl').open('a', encoding='utf-8') as log:
+            log.write(json.dumps(report) + '\n')
         if status.get('state') == 'DONE':
             if done_since is None:
                 done_since = now

@@ -102,6 +102,7 @@ def run_mission(cfg, io):
     last_visited = 0
     last_furn = -1e9
     last_match = -1e9
+    previous_v = 0.0
     while True:
         tick_start = time.perf_counter()
         if io.step() == -1:
@@ -116,7 +117,7 @@ def run_mission(cfg, io):
             io.drive(0.0, 0.0)
             continue
         if now - last_match >= cfg.localization.period:
-            pose = estimator.correct_with_scan(grid, angles, ranges)
+            pose = estimator.correct_with_scan(grid, angles, ranges, commanded_v=previous_v)
             last_match = now
         # 지도 갱신은 Mission.step 내부에서 (동적 빔 제외 후) 수행
         img = io.camera_image()
@@ -128,10 +129,12 @@ def run_mission(cfg, io):
         mission_start = time.perf_counter()
         v, w, info = mission.step(now, pose, angles, ranges, img)
         io.drive(v, w)
+        previous_v = v
         output_start = time.perf_counter()
         if yolo_due:
             # Retain the exact frame used for these boxes, not a later image.
-            camera_frame, camera_detection, camera_time = img, mission.detector.last, now
+            camera_frame, camera_time = img, now
+            camera_detection = mission.detector.last if mission.detector.visible else None
 
         # YOLO 가구 스캔 — 탁자류 방향의 LiDAR 최소거리로 위치를 잡아
         # '밑으로 파고들지 않을 구역'으로 등록 (갇힘의 예방 레이어)
