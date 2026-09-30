@@ -21,6 +21,10 @@
 <body>
 <h3>Search &amp; Rescue — 실시간 지도 + 카메라/YOLO 뷰</h3>
 <div id="meta">로봇이 시작하면 화면이 나타납니다…</div>
+<div id="stale-help" hidden style="color:#ffcc80; margin:8px 16px; font-size:13px;">
+  선택한 실행에서 새 데이터가 도착하지 않습니다. 검증 실행이 종료됐거나 Webots가 일시정지됐을 수 있습니다.
+  <a href="live_view.html">일반 실행 보기</a>
+</div>
 <label style="font-size:12px">표시할 실행
   <select id="run"><option value="">일반 실행</option><option value="validation">독립 검증 실행</option></select>
 </label>
@@ -64,6 +68,9 @@
   const run = document.getElementById('run');
   run.value = new URLSearchParams(location.search).get('run') === 'validation' ? 'validation' : '';
   const base = run.value ? 'out/validation/' : 'out/';
+  const sourceLabel = run.value ? '독립 검증 실행' : '일반 실행';
+  img.src = base + 'live_map.png?t=' + Date.now();
+  cam.src = base + 'live_cam.png?t=' + Date.now();
   run.onchange = () => { location.search = run.value ? '?run=validation' : ''; };
   document.querySelector('a[download]').href = base + 'map_data.npz';
   document.querySelector('a[target="_blank"]').href = base + 'live_status.json';
@@ -75,13 +82,18 @@
   async function refresh() {
     if (pending) return;
     pending = true;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000);
     try {
-      const response = await fetch(base + 'live_status.json?t=' + Date.now(), {cache:'no-store'});
+      const response = await fetch(base + 'live_status.json?t=' + Date.now(), {cache:'no-store', signal:controller.signal});
       if (!response.ok) throw new Error('상태 파일 대기 중');
       const s = await response.json();
-      const stale = Date.now() / 1000 - s.updated_at > 5;
-      put('meta', (stale ? '갱신 멈춤 · Webots 일시정지/컨트롤러 상태 확인' : '실시간 연결') +
-        ' · ' + new Date(s.updated_at * 1000).toLocaleTimeString());
+      const age = Math.max(0, Date.now() / 1000 - s.updated_at);
+      const stale = !Number.isFinite(age) || age > 5;
+      document.getElementById('stale-help').hidden = !stale;
+      put('meta', sourceLabel + ' · ' + (stale ? '갱신 멈춤' : '실시간 연결') +
+        ' · 마지막 데이터 ' + new Date(s.updated_at * 1000).toLocaleTimeString() +
+        (stale && Number.isFinite(age) ? ' (' + Math.floor(age) + '초 전)' : ''));
       put('state', s.state === 'DONE' ? (s.success ? '목표 완료 · 복귀 정지' : '미완료 · 복귀 정지') : (labels[s.state] || s.state));
       put('visited', s.visited === undefined ? '—' : s.visited + ' / ' + s.num_targets);
       put('home', s.distance_to_start === undefined ? '—' : s.distance_to_start.toFixed(2) + ' m');
@@ -95,10 +107,12 @@
         `시뮬레이션 ${s.sim_time.toFixed(1)}s · 관측한 면적 ${s.known_area_m2.toFixed(1)}m² · 복귀 경로 ${s.return_method}\n` +
         `현재 영상 객체: ${objects}\n` +
         `YOLO 전처리~결과 수신 ${s.yolo_ms?.toFixed(1) ?? '—'}ms · ${s.hsv_backend}\n` +
+        `현재 실행 위치 추정: ${s.localization || '정보 없음'}\n` +
         `제어 1회 평균: ${timings}` : '모델과 센서 준비 중…');
     } catch (e) {
-      put('meta', '상태 연결 대기 · ' + e.message);
-    } finally { pending = false; }
+      document.getElementById('stale-help').hidden = false;
+      put('meta', sourceLabel + ' · ' + (e.name === 'AbortError' ? '응답 지연 · 자동 재연결 중' : '상태 연결 대기 · ' + e.message));
+    } finally { clearTimeout(timeout); pending = false; }
     img.src = base + "live_map.png?t=" + Date.now();
     cam.src = base + "live_cam.png?t=" + Date.now();
   }
