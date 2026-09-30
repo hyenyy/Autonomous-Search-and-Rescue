@@ -301,6 +301,7 @@ def test_breadcrumbs():
 
 def test_energy_aware_return():
     cfg = default_config()
+    cfg.energy.enabled = True
     cfg.energy.initial_percent = 20.0
     cfg.energy.reserve_percent = 10.0
     cfg.energy.percent_per_meter = 1.0
@@ -314,6 +315,51 @@ def test_energy_aware_return():
     # 5%를 주행에 사용해 15%가 남고, 귀환 5% + reserve 10%가 필요하다.
     assert abs(energy.percent - 15.0) < 1e-9
     assert energy.should_return((5.0, 0.0, 0.0), bc)
+
+
+def test_mission_ignores_low_battery_until_all_targets():
+    """잔량이 0이어도 목표 완료 전에는 RETURN으로 전환하지 않는다."""
+    cfg = default_config()
+    cfg.energy.enabled = True       # 실수로 켜져도 미션 선점 금지
+    cfg.energy.initial_percent = 0.0
+    cfg.mission.num_targets = 2
+    cfg.map.half_size = 2.0
+    grid = OccupancyGrid(cfg, (0.0, 0.0))
+    mission = Mission(cfg, grid)
+    mission.state = Mission.EXPLORE
+    mission._enter(Mission.RETURN, 0.5)
+    assert mission.state == Mission.EXPLORE
+    angles = np.linspace(-math.pi, math.pi, 36, endpoint=False)
+    ranges = np.full(36, np.inf)
+
+    mission.step(1.0, (0.0, 0.0, 0.0), angles, ranges, None)
+
+    assert mission.state != Mission.RETURN
+    assert mission.return_reason is None
+
+
+def test_mission_returns_home_only_after_second_target():
+    cfg = default_config()
+    cfg.mission.num_targets = 2
+    cfg.map.half_size = 2.0
+    grid = OccupancyGrid(cfg, (0.0, 0.0))
+    mission = Mission(cfg, grid)
+    mission.state = Mission.GOTO_TARGET
+    mission.visited_targets = [(1.0, 1.0)]
+    mission.target_found = True
+    mission.target_est = (0.2, 0.0)
+    angles = np.linspace(-math.pi, math.pi, 36, endpoint=False)
+    ranges = np.full(36, np.inf)
+
+    mission._do_goto(1.0, (0.0, 0.0, 0.0), angles, ranges)
+
+    assert len(mission.visited_targets) == 2
+    assert mission.target_reached
+    assert mission.state == Mission.RETURN
+    assert mission.return_reason == "MISSION_COMPLETE"
+
+    mission._do_return(2.0, (0.0, 0.0, 0.0), angles, ranges)
+    assert mission.state == Mission.DONE
 
 
 def test_frontier_explorer():

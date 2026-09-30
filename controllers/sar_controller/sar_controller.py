@@ -53,6 +53,9 @@ def main():
 
     print(f"[sar] timestep={io.timestep}ms lidar={io.lidar is not None} "
           f"camera={io.camera is not None}")
+    print(f"[sar] 실시간 지도/카메라 화면: "
+          f"{os.path.join(_ROOT, 'live_view.html')}")
+    print("[sar] 복귀 조건: 빨간 사과 목표 개수 모두 방문 완료")
     mission.detector.yolo_warmup()
 
     now = 0.0

@@ -56,7 +56,7 @@ class Mission:
         self._seek_block_until = -1e9
         self.target_found = False    # '현재' 목표 확정 여부
         self.target_reached = False  # '모든' 목표 방문 완료 여부
-        self.return_reason = None    # MISSION_COMPLETE/LOW_BATTERY/...
+        self.return_reason = None    # 현재 미션은 MISSION_COMPLETE일 때만 복귀
         self.table_cells_added = 0   # 카메라+LiDAR 가상 테이블 장애물 셀
 
         # stuck 감지
@@ -71,6 +71,9 @@ class Mission:
         self.start_time = None
         self._last_map_t = -1e9      # 지도 갱신 주기 관리 (Mission이 직접)
         self._amnesty_count = 0      # frontier 블랙리스트 사면 횟수
+        self._rescan_goals = []      # frontier 소진 뒤 재방문할 기존 탐색 지점
+        self._rescan_index = 0
+        self._rescan_goal = None
         self._goto_fail_since = None # GOTO 계획 연속 실패 시각
         # 명령 평활화 상태 (문 앞 떨림 제거)
         self._v_prev = 0.0
@@ -79,6 +82,9 @@ class Mission:
 
     # ── 내부 유틸 ─────────────────────────────────────────────
     def _enter(self, state, now):
+        if state == self.RETURN and not self.target_reached:
+            print("[mission] 목표 미완료 상태의 조기 귀환 요청 무시")
+            return
         self.state = state
         self.state_since = now
 
@@ -334,28 +340,9 @@ class Mission:
                 and self.state in (self.SPIN, self.EXPLORE):
             self._enter(self.SEEK, now)
 
-        # 포기 시간 초과 → 복귀
-        if cfg.mission.give_up_time > 0 and not self.target_reached \
-                and self.state in (self.SPIN, self.EXPLORE, self.SEEK,
-                                   self.GOTO_TARGET) \
-                and now - self.start_time > cfg.mission.give_up_time:
-            self.return_reason = "TIMEOUT"
-            self._enter(self.RETURN, now)
-
-        # 에너지 안전 계층은 목표 추적보다 우선한다. 고정 20% 임계값이
-        # 아니라 현재 위치에서 breadcrumb로 귀환하는 데 필요한 양과
-        # reserve를 비교한다. RECOVER 중이면 복구 직후 곧바로 귀환한다.
-        active = (self.SPIN, self.EXPLORE, self.SEEK, self.GOTO_TARGET)
-        if self.state in active and self.energy.should_return(pose, self.crumbs):
-            self.return_reason = "LOW_BATTERY"
-            print(f"[mission] 저전력 안전 귀환 — battery="
-                  f"{self.energy.percent:.1f}% required="
-                  f"{self.energy.required_return_percent(pose, self.crumbs):.1f}%")
-            self._enter(self.RETURN, now)
-        elif self.state == self.RECOVER \
-                and self.energy.should_return(pose, self.crumbs):
-            self.return_reason = "LOW_BATTERY"
-            self._recover_after = self.RETURN
+        # 배터리 값은 화면/로그용 추정치일 뿐 미션을 선점하지 않는다.
+        # 빨간 사과를 cfg.mission.num_targets개 모두 방문하기 전에는
+        # RETURN으로 전환하지 않는다.
 
         # stuck → RECOVER (SPIN/DONE/RECOVER 제외)
         if self.state in (self.EXPLORE, self.SEEK, self.GOTO_TARGET,
@@ -521,7 +508,9 @@ class Mission:
                 self._amnesty_count += 1
                 self.explorer.blacklist.clear()
                 return 0.0, 0.0
-            # 복귀 전 마지막 360도 — 카메라가 못 훑은 방향 최종 확인
+            # frontier가 소진돼도 미션 실패로 귀환하지 않는다. 먼저 현재
+            # 위치에서 360도 확인한 뒤, 지나온 안전 지점을 순회하며 다시
+            # 카메라 스캔한다. 두 목표를 모두 찾을 때까지 이 순회를 반복한다.
             if not self._final_spin_done:
                 self._final_spin_done = True
                 self._force_full_spin = True
@@ -530,13 +519,56 @@ class Mission:
                 self._spin_return_state = self.EXPLORE
                 self._enter(self.SPIN, now)
                 return 0.0, 0.0
-            self._enter(self.RETURN, now)
-            if self.return_reason is None:
-                self.return_reason = "SEARCH_EXHAUSTED"
-            return 0.0, 0.0
+            return self._do_rescan_patrol(now, pose)
         ok = self.planner.plan_to(pose, target, now)
         if not ok:
             self.explorer.fail_current()
+            return 0.0, 0.0
+        return self.planner.follow(pose)
+
+    def _build_rescan_goals(self, pose):
+        """기존 breadcrumb에서 약 1 m 간격의 재탐색 지점을 만든다."""
+        goals = []
+        for p in self.crumbs.crumbs:
+            if dist(p, pose) < self.cfg.explore.reach_tolerance:
+                continue
+            if not goals or dist(p, goals[-1]) >= 1.0:
+                goals.append(p)
+        # 최근 탐색 지점부터 거슬러 가면 현재 위치에서 첫 이동이 짧고,
+        # 이미 통과한 경로라 계획 실패 가능성도 낮다.
+        self._rescan_goals = list(reversed(goals))
+        self._rescan_index = 0
+
+    def _do_rescan_patrol(self, now, pose):
+        """미탐색 frontier가 없어도 포기하지 않고 카메라 재수색을 계속한다."""
+        if not self._rescan_goals:
+            self._build_rescan_goals(pose)
+        if not self._rescan_goals:
+            # 이동 이력이 아직 없으면 제자리 360도 재스캔을 반복한다.
+            self._force_full_spin = True
+            self.spin_accum = 0.0
+            self.last_spin_t = now
+            self._spin_return_state = self.EXPLORE
+            self._enter(self.SPIN, now)
+            return 0.0, 0.0
+
+        if self._rescan_goal is None:
+            self._rescan_goal = self._rescan_goals[self._rescan_index]
+            self._rescan_index = (self._rescan_index + 1) \
+                % len(self._rescan_goals)
+
+        if dist(pose, self._rescan_goal) < self.cfg.explore.reach_tolerance:
+            self._rescan_goal = None
+            self._force_full_spin = True
+            self.spin_accum = 0.0
+            self.last_spin_t = now
+            self._spin_return_state = self.EXPLORE
+            self._enter(self.SPIN, now)
+            return 0.0, 0.0
+
+        ok = self.planner.plan_to(pose, self._rescan_goal, now)
+        if not ok:
+            self._rescan_goal = None
             return 0.0, 0.0
         return self.planner.follow(pose)
 

@@ -179,13 +179,13 @@ class ExploreConfig:
 
 @dataclass
 class EnergyConfig:
-    """주행 거리 기반 배터리 추정과 안전 귀환 설정.
+    """주행 거리 기반 배터리 추정 설정.
 
     Webots 기본 로봇에 실제 배터리 센서가 없어도 시연 가능한 보수적
-    에너지 모델이다. 실제 센서가 제공되면 initial_percent 대신 센서 값을
-    EnergyManager에 주입하도록 교체하면 된다.
+    에너지 모델이다. 현재 2사과 미션에서는 잔량을 상태 표시에만 사용하고
+    저전력 조기 귀환은 사용하지 않는다.
     """
-    enabled: bool = True
+    enabled: bool = False
     initial_percent: float = 100.0
     percent_per_meter: float = 1.0
     percent_per_radian: float = 0.03
@@ -208,7 +208,7 @@ class MissionConfig:
     stuck_dist: float = 0.08             # m, 이만큼도 못 가면 → recovery
     crumb_spacing: float = 0.25          # m, breadcrumb 기록 간격
     use_astar_return: bool = True        # False면 무조건 breadcrumb 복귀
-    give_up_time: float = 0.0            # s, 0=무제한. 초과 시 목표 포기하고 복귀
+    give_up_time: float = 0.0            # s, 0=무제한 (2사과 미션은 반드시 0)
 
 
 @dataclass

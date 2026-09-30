@@ -8,5 +8,8 @@
   "detection": {
     "target_color": "red",
     "use_yolo": true
+  },
+  "energy": {
+    "enabled": false
   }
 }
