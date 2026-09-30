@@ -1,0 +1,15 @@
+{
+  "mission": {
+    "start_x": -0.3,
+    "start_y": -7.5,
+    "start_theta": 3.14159,
+    "num_targets": 2
+  },
+  "detection": {
+    "target_color": "red",
+    "use_yolo": true
+  },
+  "energy": {
+    "enabled": false
+  }
+}

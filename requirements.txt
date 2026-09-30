@@ -1,0 +1,3 @@
+numpy>=1.26
+matplotlib>=3.8    # 선택: 지도 시각화 (없어도 파이프라인은 동작)
+ultralytics>=8.3   # YOLO11n COCO apple(47) 우선 탐지

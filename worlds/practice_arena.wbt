@@ -1,0 +1,120 @@
+#VRML_SIM R2025a utf8
+# 연습용 Search & Rescue 아레나 — sim_offline.py 시나리오와 동일 구조.
+# 6x6m, 시작 좌하단(-2.4,-2.4), 빨간 원기둥 목표 우상단(2.2,2.0),
+# 왼쪽 방에 왕복 보행자. 로봇: TurtleBot3 Burger + LDS-01 + 카메라.
+#
+# Pedestrian 로드가 실패하면 해당 블록을 지우고 돌려도 된다.
+
+# R2025a macOS 배포본은 프로토를 로컬에 안 담고 웹 캐시 방식 사용 —
+# 주최측 월드와 동일한 https URL을 쓴다 (첫 로드에 네트워크 필요, 이후 캐시)
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/RectangleArena.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/robotis/turtlebot/protos/TurtleBot3Burger.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/devices/robotis/protos/RobotisLds01.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/humans/pedestrian/protos/Pedestrian.proto"
+EXTERNPROTO "../protos/RedApple.proto"
+
+WorldInfo {
+  basicTimeStep 64
+}
+Viewpoint {
+  orientation -0.4 0.4 0.82 1.8
+  position 0.2 -5.5 6.5
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+RectangleArena {
+  floorSize 6 6
+  wallHeight 0.25
+}
+
+# ── 내부 벽 ──────────────────────────────────────────────────
+# 세로 벽: x=0, y -3.0 → 0.3 (시작점에서 목표 시야 차단)
+Solid {
+  translation 0 -1.35 0.15
+  children [
+    DEF WALL1_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.7 0.72
+        roughness 1
+        metalness 0
+      }
+      geometry Box {
+        size 0.1 3.3 0.3
+      }
+    }
+  ]
+  name "wall_vertical"
+  boundingObject USE WALL1_SHAPE
+}
+# 가로 벽: y=0, x 0.8 → 3.0
+Solid {
+  translation 1.9 0 0.15
+  children [
+    DEF WALL2_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.7 0.72
+        roughness 1
+        metalness 0
+      }
+      geometry Box {
+        size 2.2 0.1 0.3
+      }
+    }
+  ]
+  name "wall_horizontal"
+  boundingObject USE WALL2_SHAPE
+}
+# 왼쪽 선반형 벽: y=0.95, x -3.0 → -1.6
+Solid {
+  translation -2.3 0.95 0.15
+  children [
+    DEF WALL3_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.7 0.72
+        roughness 1
+        metalness 0
+      }
+      geometry Box {
+        size 1.4 0.1 0.3
+      }
+    }
+  ]
+  name "wall_shelf"
+  boundingObject USE WALL3_SHAPE
+}
+
+# ── 목표 물체: 주최측과 동일한 빨간 사과 (upstream proto) ──────
+RedApple {
+  translation 2.2 2.0 0.05
+}
+
+# ── 이동 보행자 (왼쪽 방 왕복) ────────────────────────────────
+Pedestrian {
+  translation -1.4 -0.45 1.27
+  controllerArgs [
+    "--trajectory=-2.2 -0.45, -0.6 -0.45"
+    "--speed=0.2"
+  ]
+}
+
+# ── 로봇 ─────────────────────────────────────────────────────
+TurtleBot3Burger {
+  translation -2.4 -2.4 0
+  rotation 0 0 1 0
+  controller "sar_controller"
+  extensionSlot [
+    RobotisLds01 {
+    }
+    Camera {
+      translation 0.05 0 -0.08
+      name "camera"
+      fieldOfView 1.0472
+      width 640
+      height 480
+    }
+  ]
+}
