@@ -41,6 +41,7 @@ class CameraConfig:
     height: int = 480
     # 카메라가 로봇 정면(x축) 기준 틀어진 각도 (보통 0)
     mount_yaw: float = 0.0
+    height_above_floor: float = 0.073   # TB3 slot z=.153 + camera z=-.08
 
 
 # 주최측 사과 프로토 baseColor 기준 HSV 프리셋 (h_lo, h_hi, s_lo, v_lo)
@@ -65,6 +66,7 @@ class DetectionConfig:
     # 프레임 점유율 상한: 사과는 최근접 유효거리(0.3m)에서도 화면의
     # ~12%가 한계 — 이보다 큰 블롭은 빨간 가구/러그 등 디코이
     max_area_ratio: float = 0.2
+    min_center_y_ratio: float = 0.45    # 바닥 사과: 수평선 위의 소화기 조각 제외
     confirm_frames: int = 4              # 연속 N프레임 탐지 시 확정 (오탐 방지)
     lost_frames: int = 15                # 연속 미탐지 시 추적 해제
     target_width: float = 0.10           # m, 목표 폭 (사과 지름 ≈ 0.1m)
@@ -77,12 +79,19 @@ class DetectionConfig:
     # 이 거리 안에서의 추정만 '확정'에 사용 (원거리 단안은 픽셀 양자화로
     # ±25% 오차 — 멀면 SEEK로 접근해서 다시 잰다)
     est_confirm_dist: float = 2.2
+    target_center_height: float = 0.05
+    height_tolerance: float = 0.06     # m, reject projections below floor / high on wall
+    target_association_radius: float = 0.65
+    target_lost_timeout: float = 12.0  # s, release a stale confirmed target
     # YOLO 확정 게이트 (주최측 제공 모델 경로 관례: models/YOLO/yolo11n.pt)
     # 색·기하만으로 못 거르는 디코이(빨간 음료캔 등) 방어. 확정 직전
-    # 1회만 실행. ultralytics/모델 없으면 자동 통과.
+    # 활성화한 YOLO가 실패하면 명시적으로 오류를 내고 컨트롤러가 정지.
     use_yolo: bool = False
     yolo_model: str = "yolo11n.pt"
     yolo_conf: float = 0.12
+    yolo_device: str = "auto"           # auto: CUDA 우선, 또는 cuda:0 / cpu
+    yolo_ambiguous_classes: tuple = ("sports ball",)  # 저폴리 사과의 실측 혼동
+    yolo_period: float = 0.25           # simulation seconds; 64ms timestep => every 4 ticks
     decoy_radius: float = 0.6            # m, YOLO가 기각한 위치 주변 재확정 금지
 
 
@@ -98,6 +107,12 @@ class MapConfig:
     l_clamp: float = 5.0
     occ_threshold: float = 1.2           # log-odds > 이 값 → 장애물
     free_threshold: float = -0.5         # log-odds < 이 값 → 빈공간
+
+
+@dataclass
+class LocalizationConfig:
+    enabled: bool = False
+    period: float = 0.192
 
 
 @dataclass
@@ -146,6 +161,8 @@ class PlanConfig:
 
 @dataclass
 class ExploreConfig:
+    progress_timeout: float = 20.0       # s without approach or new mapped area
+    progress_distance: float = 0.15      # m of approach needed to renew a goal
     # 벽 추종(우수법) 우선 탐사 — 외곽 일주로 지도 골격을 빠르게 완성.
     # 루프 폐합/타임아웃 후 frontier 탐사가 실내 잔여 구역을 마무리.
     # (mission.map_first=True일 때만 사용)
@@ -189,6 +206,7 @@ class MissionConfig:
 
 @dataclass
 class Config:
+    localization: LocalizationConfig = field(default_factory=LocalizationConfig)
     robot: RobotConfig = field(default_factory=RobotConfig)
     lidar: LidarConfig = field(default_factory=LidarConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)

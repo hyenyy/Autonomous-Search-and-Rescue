@@ -3,7 +3,7 @@
 모든 상태에서 LocalAvoider 회피는 항상 적용된다.
 main 루프(오프라인 sim / Webots controller)는 매 스텝:
     mission.step(now, pose, angles, ranges, camera_img) → (v, w, info)
-만 호출하면 된다. 지도 갱신은 main 루프 책임.
+만 호출하면 된다. 지도 갱신은 동적 장애물 분류 뒤 이 모듈에서 수행한다.
 """
 import math
 
@@ -57,6 +57,8 @@ class Mission:
         self.visited_targets = []    # 방문 완료한 목표 위치들
         self._seek_block_until = -1e9
         self.target_found = False    # '현재' 목표 확정 여부
+        self._target_anchor = None
+        self._target_seen_t = 0.0
         self.target_reached = False  # '모든' 목표 방문 완료 여부
 
         # 지도 우선 전략: 탐사 중 목표는 후보로만 기억 → 지도 완성 후 방문
@@ -103,10 +105,15 @@ class Mission:
         # 명령 평활화 상태 (문 앞 떨림 제거)
         self._v_prev = 0.0
         self._w_prev = 0.0
+        self._last_scan_pose = None
+        self._last_scan_time = -1e9
         self._last_step_t = None
 
     # ── 내부 유틸 ─────────────────────────────────────────────
     def _enter(self, state, now):
+        if state == self.GOTO_TARGET and self._target_anchor is None:
+            self._target_anchor = self.target_est
+            self._target_seen_t = now
         if state == self.SPIN:
             # 정지 스캔 구간이 stuck 이력에 섞이면 스핀 직후 오탐이 난다
             self._pose_hist.clear()
@@ -262,6 +269,20 @@ class Mission:
                 accepted, acc_d = (mono[0], mono[1]), mono[2]
         if accepted is None:
             return
+        # A 10cm floor apple must project near its known height. Letter-sized
+        # red patches on walls can pass color/shape but imply a point below the
+        # floor when their width is mistaken for an apple. No ground truth used.
+        if det.bbox is not None and not det.v_clipped:
+            camera = self.cfg.camera
+            cy = (det.bbox[1] + det.bbox[3]) / 2
+            focal = (camera.width / 2) / math.tan(camera.hfov / 2)
+            depth = acc_d * math.cos(det.bearing - camera.mount_yaw)
+            height = camera.height_above_floor - (cy - camera.height / 2) * depth / focal
+            if abs(height - dcfg.target_center_height) > dcfg.height_tolerance:
+                return
+        if self.target_found and self._target_anchor is not None \
+                and dist(accepted, self._target_anchor) > dcfg.target_association_radius:
+            return  # do not drag one confirmed target toward another red object
         # 등록된 디코이(YOLO 기각 위치)·이미 방문한 목표 주변 추정은 버린다
         r_d = self.cfg.detection.decoy_radius
         if any(dist(accepted, dc) < r_d for dc in self._decoys):
@@ -292,6 +313,7 @@ class Mission:
             a = 0.35
             self.target_est = (self.target_est[0] * (1 - a) + accepted[0] * a,
                                self.target_est[1] * (1 - a) + accepted[1] * a)
+        return True
 
     def note_furniture(self, xy, now=0.0, label=""):
         """컨트롤러의 YOLO 가구 탐지 보고 — 0.6m 내 기존 구역과 병합.
@@ -346,11 +368,14 @@ class Mission:
         self.candidates.remove(best)
         return best["xy"]
 
-    def _spin_worthwhile(self):
+    def _spin_worthwhile(self, now=None, pose=None):
         """지난 카메라 스윕 이후 지도가 유의미하게 자랐는가.
 
         안 자랐다 = 이미 훑은 구역을 재통과 중 — 여기서 또 도는 건
         순수 낭비다. 새 방에 들어서면 성장이 감지되어 스윕이 돌아온다."""
+        if now is not None and pose is not None and self._last_scan_pose is not None:
+            if now - self._last_scan_time < 16 or dist(pose, self._last_scan_pose) < 1.0:
+                return False
         known_now = int((~self.grid.unknown_mask()).sum())
         return known_now - self._known_at_spin >= 250   # ≈0.6m² 신규
 
@@ -530,8 +555,15 @@ class Mission:
         if self.state not in (self.RETURN, self.DONE):
             self.crumbs.record(pose)
         self.detector.process(camera_img)
-        if self.detector.visible:
-            self._update_target_estimate(pose, angles, ranges)
+        valid_estimate = False
+        if self.detector.visible and self.state not in (self.RETURN, self.DONE):
+            valid_estimate = bool(self._update_target_estimate(pose, angles, ranges))
+        if valid_estimate:
+            self._target_seen_t = now
+        else:
+            self._est_hist.clear()
+            if not self.target_found:
+                self.target_est = None
         # 지도 우선 모드의 탐사 단계: 초근접(즉시 잡는 게 싼 거리) 아니면
         # 확정하지 않는다 — 후보로 기억만 하고 지도 완성을 계속한다
         allow_confirm = True
@@ -540,14 +572,15 @@ class Mission:
                 and dist(pose, self.target_est) \
                 > self.cfg.mission.opportunistic_dist:
             allow_confirm = False
-        if allow_confirm and self.detector.confirmed \
+        if allow_confirm and valid_estimate and self.detector.confirmed \
                 and not self.target_found \
                 and self.target_est is not None and self._estimate_stable():
-            # 최종 게이트: YOLO(활성 시)가 후보 블롭을 'apple'로 인정해야
+            # 최종 게이트: YOLO(활성 시)가 비사과 물체로 기각하지 않아야
             # 확정. 기각되면 그 위치를 디코이로 등록하고 추정 리셋 —
             # 빨간 음료캔 같은 색·기하 통과형 디코이 방어.
             if self.detector.yolo_confirm(camera_img, self.detector.last):
                 self.target_found = True
+                self._target_anchor = self.target_est
                 self._confirm_img = camera_img       # 검증용 확정 프레임
                 d0 = self.detector.last
                 print(f"[mission] 목표 확정 est=({self.target_est[0]:+.2f},"
@@ -737,14 +770,18 @@ class Mission:
         self._last_step_t = now
         dv_max = 0.35 * dt_cmd            # 가속 한계 (0→최고속 ~0.6s)
         dw_max = 6.0 * dt_cmd             # 조향 변화 한계 (풀스윙 ~0.5s)
-        if v > self._v_prev:
-            v = min(v, self._v_prev + dv_max)
+        if v > 0.0:
+            v = min(v, max(0.0, self._v_prev) + dv_max)
         w = max(self._w_prev - dw_max, min(self._w_prev + dw_max, w))
+        if self.state == self.DONE:
+            v, w = 0.0, 0.0
         self._v_prev, self._w_prev = v, w
 
         self._last_theta = pose[2]
         info = {
             "state": self.state,
+            "start": self.start_xy,
+            "distance_to_start": dist(pose, self.start_xy),
             "dyn_count": int(dyn.sum()) if dyn is not None else 0,
             "target_est": self.target_est,
             "goal": self.planner.goal,
@@ -753,6 +790,9 @@ class Mission:
             "found": self.target_found,
             "visited": len(self.visited_targets),
             "reached": self.target_reached,
+            "success": (self.state == self.DONE
+                        and len(self.visited_targets) >= cfg.mission.num_targets),
+            "visited_targets": list(self.visited_targets),
             "candidates": [c["xy"] for c in self.candidates],
             "furniture": list(self.planner.furniture_xy),
         }
@@ -767,6 +807,8 @@ class Mission:
         이후 주기 스캔: 전방 ±spin_arc/2 스윕만 (한 바퀴 8초 → 2~3초).
         """
         cfg = self.cfg
+        self._last_scan_pose = pose[:2]
+        self._last_scan_time = now
         # 사람이 접근 중이면 스캔 중단 — 정지 스캔은 서서 치이는 자세다.
         # 지나간 뒤 주기 로직이 다시 스핀을 잡는다.
         if self.planner.avoid_xy is not None \
@@ -836,7 +878,7 @@ class Mission:
         if cfg.explore.spin_period > 0 \
                 and now - self.last_spin_t > cfg.explore.spin_period:
             self.last_spin_t = now
-            if self._spin_worthwhile():
+            if self._spin_worthwhile(now, pose):
                 self.spin_accum = 0.0
                 self._spin_phase = "left"
                 self._spin_return_state = self.WALL_FOLLOW
@@ -962,7 +1004,7 @@ class Mission:
         if cfg.explore.spin_period > 0 \
                 and now - self.last_spin_t > cfg.explore.spin_period:
             self.last_spin_t = now      # 게이트 불통과 시에도 주기 리셋
-            if self._spin_worthwhile():
+            if self._spin_worthwhile(now, pose):
                 self.spin_accum = 0.0
                 self._spin_phase = "left"
                 self._spin_return_state = self.EXPLORE
@@ -970,12 +1012,12 @@ class Mission:
                 return 0.0, 0.0
 
         target = self.explorer.update(pose, person_xy=self.planner.avoid_xy,
-                                      furniture=self.planner.furniture_xy)
+                                      furniture=self.planner.furniture_xy, now=now)
         # frontier 도착 = 새 시야가 열린 순간 → 카메라 스윕 1회
         # (여기도 신규 지도 게이트 — 열린 게 없으면 그냥 다음으로)
         if self.explorer.just_reached:
             self.explorer.just_reached = False
-            if self._spin_worthwhile():
+            if self._spin_worthwhile(now, pose):
                 self.spin_accum = 0.0
                 self._spin_phase = "left"
                 self.last_spin_t = now
@@ -1057,6 +1099,15 @@ class Mission:
 
     def _do_goto(self, now, pose, angles, ranges):
         cfg = self.cfg
+        if now - self._target_seen_t > cfg.detection.target_lost_timeout:
+            print("[mission] 목표 재관측 시간 초과 — 오래된 추정 폐기, 탐색 재개")
+            self.target_found = False
+            self.target_est = self._target_anchor = None
+            self._est_hist.clear()
+            self.planner.waypoints = []
+            self._seek_block_until = now + 8.0
+            self._enter(self.EXPLORE, now)
+            return 0.0, 0.0
         if self.target_est is None:      # 추정 소실 (이례적) → 탐색 복귀
             self.target_found = False
             self._enter(self.EXPLORE, now)
@@ -1073,6 +1124,7 @@ class Mission:
                   f"({self.target_est[0]:+.2f},{self.target_est[1]:+.2f})")
             self.target_found = False
             self.target_est = None
+            self._target_anchor = None
             self._est_hist.clear()
             self._seek_block_until = now + 8.0   # 방금 그 사과 응시 방지
             if k >= cfg.mission.num_targets:

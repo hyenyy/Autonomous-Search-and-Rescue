@@ -382,6 +382,8 @@ class Planner:
                 break
         heading = math.atan2(target[1] - pose[1], target[0] - pose[0])
         err = wrap_angle(heading - pose[2])
+        if abs(err) < .035:  # Ignore insignificant heading noise during path following.
+            err = 0.0
         w = max(-cfg.robot.max_w, min(cfg.robot.max_w, cfg.plan.k_heading * err))
         # 오차가 크면 전진 억제 (제자리 회전 우선)
         v = cfg.robot.max_v * max(0.0, 1.0 - abs(err) / (math.pi / 2))

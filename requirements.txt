@@ -1,2 +1,6 @@
 numpy>=1.26
-matplotlib>=3.8    # 선택: 지도 시각화 (없어도 파이프라인은 동작)
+matplotlib>=3.8
+opencv-python>=4.10
+Pillow>=10
+ultralytics>=8.4,<9
+# Install the CUDA PyTorch build first; see docs/WINDOWS_GPU.md.

@@ -8,6 +8,12 @@
          display:flex; flex-direction:column; align-items:center; }
   h3 { margin:10px 0 4px; font-weight:normal; }
   #meta { font-size:12px; color:#8a8; margin-bottom:6px; }
+  #status { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin:12px; }
+  .metric { background:#20252c; border:1px solid #39424d; padding:10px 16px; border-radius:6px; }
+  .metric span { color:#9daaba; display:block; font-size:12px; margin-bottom:6px; }
+  .metric strong { font-size:18px; }
+  #details { white-space:pre-wrap; line-height:1.7; margin:14px; max-width:1100px; }
+  a { color:#80caff; }
   img { max-width:96vw; max-height:88vh; image-rendering:auto;
         border:1px solid #333; }
 </style>
@@ -15,6 +21,16 @@
 <body>
 <h3>Search &amp; Rescue — 실시간 지도 + 카메라/YOLO 뷰</h3>
 <div id="meta">로봇이 시작하면 화면이 나타납니다…</div>
+<label style="font-size:12px">표시할 실행
+  <select id="run"><option value="">일반 실행</option><option value="validation">독립 검증 실행</option></select>
+</label>
+<div id="status">
+  <div class="metric"><span>미션 상태</span><strong id="state">대기</strong></div>
+  <div class="metric"><span>방문한 목표</span><strong id="visited">—</strong></div>
+  <div class="metric"><span>시작점까지 추정 거리</span><strong id="home">—</strong></div>
+  <div class="metric"><span>실측 배속</span><strong id="speed">—</strong></div>
+  <div class="metric"><span>YOLO 장치 / 주기</span><strong id="device">—</strong></div>
+</div>
 <div style="display:flex; gap:12px; flex-wrap:wrap; justify-content:center;
             align-items:flex-start; padding:0 8px;">
   <figure style="margin:0; text-align:center;">
@@ -22,7 +38,7 @@
          style="max-width:48vw; max-height:80vh;">
     <figcaption style="font-size:12px; color:#999; margin-top:4px;">
       지도 — 흰:빈공간 검:장애물 회색:미탐색 · 초록:로봇 · 주황:자취 ·
-      파랑:경로/목적지 · 빨강:목표 추정 · 보라:목표 후보 ·
+      청록:시작점 · 파랑:경로/목적지 · 노랑:미방문 목표 추정 · 빨강:방문 완료 · 보라:목표 후보 ·
       갈색:가구 회피 구역(YOLO)</figcaption>
   </figure>
   <figure style="margin:0; text-align:center;">
@@ -31,21 +47,63 @@
     <figcaption style="font-size:12px; color:#999; margin-top:4px;">
       카메라 — <span style="color:#ff0">노랑: HSV 후보 블롭</span> ·
       <span style="color:#0f0">초록: YOLO 탐지 박스</span>
-      (후보 보일 때 4초 간격)</figcaption>
+      (동일 프레임에 클래스·신뢰도 표시)</figcaption>
   </figure>
 </div>
+<div id="details">위치·경로·성능 데이터 대기 중…</div>
+<p style="color:#aaa; font-size:12px; margin:4px 16px 18px;">
+  지도는 LiDAR 관측 범위만 누적합니다. 위치는 인코더·컴퍼스와 설정된 국소 LiDAR 지도 정합으로 추정합니다.
+  전역 loop closure는 적용되지 않았습니다.<br>
+  <a href="out/map_data.npz" download>지도 원본 저장 (.npz)</a> ·
+  <a href="out/live_status.json" target="_blank">현재 상태 데이터</a>
+</p>
 <script>
   const img = document.getElementById("map");
   const cam = document.getElementById("cam");
   const meta = document.getElementById("meta");
-  let ok = 0;
-  img.onload = () => { ok++; meta.textContent =
-      "갱신 " + ok + "회 · " + new Date().toLocaleTimeString(); };
-  img.onerror = () => { meta.textContent = "지도 파일 대기 중…"; };
-  setInterval(() => {
-    img.src = "out/live_map.png?t=" + Date.now();
-    cam.src = "out/live_cam.png?t=" + Date.now();
-  }, 1500);
+  const run = document.getElementById('run');
+  run.value = new URLSearchParams(location.search).get('run') === 'validation' ? 'validation' : '';
+  const base = run.value ? 'out/validation/' : 'out/';
+  run.onchange = () => { location.search = run.value ? '?run=validation' : ''; };
+  document.querySelector('a[download]').href = base + 'map_data.npz';
+  document.querySelector('a[target="_blank"]').href = base + 'live_status.json';
+  const labels = {STARTING:'모델 준비 중', SPIN:'주변 관찰', EXPLORE:'탐색 중',
+    SEEK:'후보 접근', GOTO_TARGET:'목표 접근', RETURN:'시작점 복귀 중',
+    RECOVER:'장애물 탈출', WALL_FOLLOW:'벽 따라 탐색', VISIT:'후보 방문', ERROR:'오류 · 정지'};
+  const put = (id, value) => document.getElementById(id).textContent = value;
+  let pending = false;
+  async function refresh() {
+    if (pending) return;
+    pending = true;
+    try {
+      const response = await fetch(base + 'live_status.json?t=' + Date.now(), {cache:'no-store'});
+      if (!response.ok) throw new Error('상태 파일 대기 중');
+      const s = await response.json();
+      const stale = Date.now() / 1000 - s.updated_at > 5;
+      put('meta', (stale ? '갱신 멈춤 · Webots 일시정지/컨트롤러 상태 확인' : '실시간 연결') +
+        ' · ' + new Date(s.updated_at * 1000).toLocaleTimeString());
+      put('state', s.state === 'DONE' ? (s.success ? '목표 완료 · 복귀 정지' : '미완료 · 복귀 정지') : (labels[s.state] || s.state));
+      put('visited', s.visited === undefined ? '—' : s.visited + ' / ' + s.num_targets);
+      put('home', s.distance_to_start === undefined ? '—' : s.distance_to_start.toFixed(2) + ' m');
+      put('speed', s.real_time_factor === undefined ? '—' : s.real_time_factor.toFixed(2) + '×');
+      put('device', s.yolo_device ? s.yolo_device + ' / ' + s.yolo_period_s + 's' : '—');
+      const p = s.pose;
+      const timings = Object.entries(s.stage_ms || {}).map(([k,v]) => k + ': ' + v.toFixed(1) + 'ms').join(' · ');
+      const objects = (s.objects || []).map(o => o.name + ' ' + Math.round(o.confidence * 100) + '%').join(', ') || '없음';
+      put('details', s.error ? s.error : p ?
+        `추정 위치 x=${p[0].toFixed(2)}m, y=${p[1].toFixed(2)}m · 방향 ${(p[2]*180/Math.PI).toFixed(1)}°\n` +
+        `시뮬레이션 ${s.sim_time.toFixed(1)}s · 관측한 면적 ${s.known_area_m2.toFixed(1)}m² · 복귀 경로 ${s.return_method}\n` +
+        `현재 영상 객체: ${objects}\n` +
+        `YOLO 전처리~결과 수신 ${s.yolo_ms?.toFixed(1) ?? '—'}ms · ${s.hsv_backend}\n` +
+        `제어 1회 평균: ${timings}` : '모델과 센서 준비 중…');
+    } catch (e) {
+      put('meta', '상태 연결 대기 · ' + e.message);
+    } finally { pending = false; }
+    img.src = base + "live_map.png?t=" + Date.now();
+    cam.src = base + "live_cam.png?t=" + Date.now();
+  }
+  refresh();
+  setInterval(refresh, 1000);
 </script>
 </body>
 </html>

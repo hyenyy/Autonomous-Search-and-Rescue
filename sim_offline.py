@@ -443,6 +443,7 @@ def run(steps=14000, scenario="rooms", with_person=True, snapshots=False,
         "collisions": collisions,
         "min_dist_to_target": max(min_dists) if min_dists else 0.0,
         "visited": len(mission.visited_targets),
+        "num_targets": cfg.mission.num_targets,
         "final_dist_to_start": final_err,
         "odom_drift": odom_err,
         "wall_time": elapsed,
@@ -462,6 +463,7 @@ def run(steps=14000, scenario="rooms", with_person=True, snapshots=False,
 
 def is_success(r):
     return (r["done"] and r["collisions"] == 0
+            and r["visited"] >= r["num_targets"]
             and r["min_dist_to_target"] < 0.75    # 진짜 목표 근처까지 갔는가
             and r["final_dist_to_start"] < 0.4)
 

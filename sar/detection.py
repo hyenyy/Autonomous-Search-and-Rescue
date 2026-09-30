@@ -1,18 +1,29 @@
-"""목표 물체 색 기반 탐지 (pure NumPy — OpenCV 불필요).
+"""목표 물체 색 기반 탐지 (OpenCV 가속, 미설치 시 NumPy 폴백).
 
 - RGB → HSV 변환 후 config의 HSV 범위로 마스크
 - 최소 픽셀 수 + N프레임 연속 확인으로 오탐 억제
 - 출력 bearing: 로봇 프레임, +값 = 왼쪽(CCW). 화면 왼쪽 = +bearing
 """
+from pathlib import Path
+import time
+
 import numpy as np
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 
 def rgb_to_hsv(img):
     """img: (H,W,3) uint8 RGB → (H,W,3) float32, H∈[0,360), S,V∈[0,1]."""
     f = img.astype(np.float32) / 255.0
+    if cv2 is not None:
+        # Float input preserves H=degrees, S/V=0..1 (uint8 uses H=0..180).
+        return cv2.cvtColor(f, cv2.COLOR_RGB2HSV)
     r, g, b = f[..., 0], f[..., 1], f[..., 2]
-    mx = f.max(axis=-1)
-    mn = f.min(axis=-1)
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
     diff = mx - mn + 1e-9
     h = np.zeros_like(mx)
     m = mx == r
@@ -55,75 +66,99 @@ class TargetDetector:
         self.last = None              # 마지막 Detection
         self._yolo = None
         self._yolo_failed = False
+        self.yolo_device = "disabled"
+        self.yolo_error = None
+        self.yolo_ms = None
+        self._yolo_frame = None
+        self._yolo_result = []
 
     def yolo_warmup(self):
         """모델 로드+더미 추론을 미션 시작 전에 — 확정 순간 수 초 블록 방지."""
-        if not self.cfg.detection.use_yolo or self._yolo_failed:
+        if not self.cfg.detection.use_yolo:
             return
+        if self._yolo_failed:
+            raise RuntimeError(self.yolo_error or "YOLO is unavailable")
         try:
             from ultralytics import YOLO
-            self._yolo = YOLO(self.cfg.detection.yolo_model)
-            self._yolo.predict(source=np.zeros((64, 64, 3), dtype=np.uint8),
-                               conf=0.5, verbose=False)
-            print("[detection] YOLO 워밍업 완료")
+            import torch
+            device = self.cfg.detection.yolo_device
+            if device == "auto":
+                device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            model = Path(self.cfg.detection.yolo_model)
+            if not model.is_absolute():
+                root = Path(__file__).resolve().parents[1]
+                candidates = [root / model, root / "controllers/sar_controller" / model]
+                model = next((p for p in candidates if p.is_file()), model)
+            if not model.is_file():
+                raise FileNotFoundError(f"YOLO model missing: {model.resolve()}")
+            self._yolo = YOLO(str(model))
+            self._yolo.predict(source=np.zeros((self.cfg.camera.height,
+                                               self.cfg.camera.width, 3), dtype=np.uint8),
+                               device=device, conf=self.cfg.detection.yolo_conf,
+                               verbose=False)
+            self.yolo_device = str(self._yolo.predictor.device)
+            print(f"[detection] YOLO 워밍업 완료 (device={self.yolo_device})")
         except Exception as e:
-            print(f"[detection] YOLO 사용 불가({e}) — 게이트 자동 통과")
             self._yolo_failed = True
+            self.yolo_error = str(e)
+            raise RuntimeError(f"YOLO startup failed: {e}") from e
+
+    def _predict(self, img_rgb):
+        """Cache only the identical immutable frame, never a later camera frame."""
+        if self._yolo_failed:
+            raise RuntimeError(self.yolo_error or "YOLO is unavailable")
+        if self._yolo is None:
+            self.yolo_warmup()
+        if img_rgb is self._yolo_frame:
+            return self._yolo_result
+        try:
+            started = time.perf_counter()
+            res = self._yolo.predict(source=np.ascontiguousarray(img_rgb[..., ::-1]),
+                                     conf=self.cfg.detection.yolo_conf, verbose=False)[0]
+            # One GPU→CPU transfer per frame, not several transfers per box.
+            rows = res.boxes.data.cpu().numpy()
+            self._yolo_result = [(res.names[int(row[5])], float(row[4]),
+                                  row[:4].tolist()) for row in rows]
+            self.yolo_ms = (time.perf_counter() - started) * 1000
+            self._yolo_frame = img_rgb
+            return self._yolo_result
+        except Exception as e:
+            self._yolo_failed = True
+            self.yolo_error = str(e)
+            raise RuntimeError(f"YOLO inference failed: {e}") from e
 
     def yolo_boxes(self, img_rgb):
-        """라이브 뷰용: YOLO 전체 탐지 박스 [(name, conf, xyxy)]. 실패 시 []."""
-        if self._yolo is None or img_rgb is None:
+        """YOLO 전체 탐지 박스 [(name, conf, xyxy)], 현재 프레임 전용."""
+        if not self.cfg.detection.use_yolo or img_rgb is None:
             return []
-        try:
-            res = self._yolo.predict(source=img_rgb[..., ::-1],
-                                     conf=0.15, verbose=False)[0]
-            return [(res.names[int(b.cls)], float(b.conf),
-                     [float(t) for t in b.xyxy[0]]) for b in res.boxes]
-        except Exception:
-            return []
+        return [box for box in self._predict(img_rgb) if box[1] >= .15]
 
     def yolo_confirm(self, img_rgb, det):
         """확정 직전 1회 실행되는 YOLO 검증 게이트.
 
-        후보 블롭 bbox와 30% 이상 겹치는 'apple' 박스가 있어야 통과.
-        ultralytics/모델이 없거나 비활성이면 통과(True).
+        후보와 강하게 겹치는 비사과 객체를 거부한다 (미탐지는 통과).
+        비활성일 때만 YOLO 검증을 생략한다. 활성 상태의 실패는 오류.
         """
         dcfg = self.cfg.detection
         if not dcfg.use_yolo or det is None or det.bbox is None \
                 or img_rgb is None:
             return True
-        if self._yolo is None:
-            if self._yolo_failed:
-                return True
-            try:
-                from ultralytics import YOLO
-                self._yolo = YOLO(dcfg.yolo_model)
-            except Exception as e:
-                print(f"[detection] YOLO 사용 불가({e}) — 게이트 자동 통과")
-                self._yolo_failed = True
-                return True
-        try:
-            res = self._yolo.predict(source=img_rgb[..., ::-1],  # RGB→BGR
-                                     conf=dcfg.yolo_conf, verbose=False)[0]
-        except Exception as e:
-            print(f"[detection] YOLO 추론 실패({e}) — 통과 처리")
-            return True
+        boxes = self._predict(img_rgb)
         # 베토 모드. 실측 근거: yolo11n은 Webots 저폴리 사과를 'apple'로
         # 인식하지 못한다(0.9m에서 미탐지) — 양성 확인을 요구하면 진짜
         # 사과가 기각된다. 대신 블롭과 강하게 겹치는 '비(非)사과' 물체
         # (캔→vase/tv, 병 등)가 잡히면 디코이로 기각한다.
         x0, y0, x1, y1 = det.bbox
         blob_area = max(1, (x1 - x0) * (y1 - y0))
-        for b in res.boxes:
-            name = res.names[int(b.cls)]
-            conf = float(b.conf)
-            bx0, by0, bx1, by1 = [float(t) for t in b.xyxy[0]]
+        for name, conf, (bx0, by0, bx1, by1) in boxes:
             iw = min(x1, bx1) - max(x0, bx0)
             ih = min(y1, by1) - max(y0, by0)
             if iw <= 0 or ih <= 0 or iw * ih <= 0.4 * blob_area:
                 continue
             if name == "apple":
                 return True                   # 명시적 사과 확인 → 통과
+            if name in dcfg.yolo_ambiguous_classes:
+                continue  # Webots apple was measured as sports ball; HSV/geometry still required.
             if conf >= 0.30:
                 print(f"[detection] YOLO 베토: '{name}' {conf:.2f}")
                 return False                  # 강한 비사과 물체 → 기각
@@ -210,7 +245,7 @@ class TargetDetector:
                 #    위에 뜬 블롭 = 공중의 물체(표지판·벽걸이 등) → 기각.
                 #    아래쪽은 근접 사과에서 정상이므로 관대하게.
                 cy_blob = float(ys.mean())
-                above_horizon = cy_blob < h * 0.35
+                above_horizon = cy_blob < h * self.cfg.detection.min_center_y_ratio
                 # ④ 채움비: 사과(구)는 bbox의 ~78%를 채운다. 표면에 글자·
                 #    무늬가 있는 물체(음료캔 등)는 마스크에 구멍이 남
                 fill = n / max(1, px_width * px_h)

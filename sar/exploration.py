@@ -17,6 +17,11 @@ class FrontierExplorer:
         self.current_target = None       # (x, y) 월드 좌표
         self.blacklist = []              # [(x, y), ...]
         self.just_reached = False        # frontier 도착 직후 1틱 True
+        self._progress_target = None
+        self._progress_distance = float('inf')
+        self._progress_known = 0
+        self._progress_since = 0.0
+        self._progress_sample = -1e9
 
     def _clusters(self):
         mask = self.grid.frontier_mask()
@@ -72,7 +77,7 @@ class FrontierExplorer:
             self.blacklist.append(self.current_target)
             self.current_target = None
 
-    def update(self, pose, person_xy=None, furniture=()):
+    def update(self, pose, person_xy=None, furniture=(), now=None):
         """탐색 목표 반환 ((x,y) 또는 None=frontier 소진).
 
         person_xy가 있으면 그 주변 frontier의 점수를 깎는다 — 움직이는
@@ -80,6 +85,28 @@ class FrontierExplorer:
         furniture(YOLO 가구 구역) 근처 frontier도 후순위 — 탁자 밑
         미탐색 셀을 굳이 기어들어가 밝히지 않는다.
         """
+        # A robot can orbit without being motionless. Require actual approach
+        # or new observed area, rather than resetting the watchdog on motion.
+        if self.current_target is not None and now is not None:
+            distance = dist(pose, self.current_target)
+            if self.current_target != self._progress_target:
+                self._progress_target = self.current_target
+                self._progress_distance = distance
+                self._progress_since = now
+                self._progress_known = int((~self.grid.unknown_mask()).sum())
+            if distance < self._progress_distance - self.cfg.explore.progress_distance:
+                self._progress_distance = distance
+                self._progress_since = now
+            if now - self._progress_sample >= 1.0:
+                self._progress_sample = now
+                known = int((~self.grid.unknown_mask()).sum())
+                if known > self._progress_known + 80:
+                    self._progress_known = known
+                    self._progress_since = now
+            if now - self._progress_since > self.cfg.explore.progress_timeout:
+                print(f"[explore] no progress toward {self.current_target}; selecting another frontier")
+                self.fail_current()
+                self._progress_target = None
         # 관성: 유효한 기존 목표 유지
         if self.current_target is not None:
             if self.target_reached(pose):

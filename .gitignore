@@ -6,3 +6,5 @@ out/
 .DS_Store
 worlds/.*.wbproj
 yolo*.pt
+worlds/apartment_sar_validation.wbt
+controllers/sar_validator/runtime.ini

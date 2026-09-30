@@ -66,7 +66,9 @@ class OccupancyGrid:
             angles, ranges = angles[keep], ranges[keep]
         angles = angles[::subsample]
         ranges = ranges[::subsample]
-        valid = np.isfinite(ranges) & (ranges > 0.01)
+        # +inf is a valid no-return beam (free up to sensor range).
+        # NaN/-inf/nonpositive readings carry no evidence.
+        valid = np.isfinite(angles) & ~np.isnan(ranges) & (ranges > 0.01)
         angles, ranges = angles[valid], ranges[valid]
         if angles.size == 0:
             return
@@ -82,8 +84,8 @@ class OccupancyGrid:
         px = x + ca[:, None] * t[None, :]                       # (B,S)
         py = y + sa[:, None] * t[None, :]
         free_m = t[None, :] < (r[:, None] - self.res * 0.6)
-        ix = ((px - self.origin_x) / self.res).astype(np.int64)
-        iy = ((py - self.origin_y) / self.res).astype(np.int64)
+        ix = np.floor((px - self.origin_x) / self.res).astype(np.int64)
+        iy = np.floor((py - self.origin_y) / self.res).astype(np.int64)
         inb = (ix >= 0) & (ix < self.n) & (iy >= 0) & (iy < self.n)
         m = free_m & inb
         if m.any():
@@ -93,8 +95,8 @@ class OccupancyGrid:
         if hit.any():
             hx = x + ca[hit] * r[hit]
             hy = y + sa[hit] * r[hit]
-            hix = ((hx - self.origin_x) / self.res).astype(np.int64)
-            hiy = ((hy - self.origin_y) / self.res).astype(np.int64)
+            hix = np.floor((hx - self.origin_x) / self.res).astype(np.int64)
+            hiy = np.floor((hy - self.origin_y) / self.res).astype(np.int64)
             inb2 = (hix >= 0) & (hix < self.n) & (hiy >= 0) & (hiy < self.n)
             if inb2.any():
                 flat2 = np.unique(hiy[inb2] * self.n + hix[inb2])

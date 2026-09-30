@@ -4,8 +4,17 @@
 - 오프라인 sim과 Webots 컨트롤러 양쪽에서 사용
 """
 import math
+import io
 
 import numpy as np
+from PIL import Image, ImageDraw
+from .runtime import atomic_write
+
+
+def save_rgb(path, rgb):
+    buf = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(rgb)).save(buf, format='PNG', compress_level=1)
+    return atomic_write(path, buf.getvalue())
 
 try:
     import matplotlib
@@ -25,8 +34,6 @@ class MapViz:
     def save_fast(self, path, pose=None, info=None):
         """경량 실시간 렌더(~10ms) — matplotlib figure는 스냅샷마다
         제어 루프를 수백 ms 블록해 주기적 스터터를 만든다. 픽셀 합성으로 대체."""
-        if not self.enabled:
-            return
         g = self.grid
         img = np.full((g.n, g.n, 3), 165, dtype=np.uint8)   # 미지 = 회색
         img[g.free_mask()] = (245, 245, 245)
@@ -39,6 +46,10 @@ class MapViz:
                     max(0, ix - r):ix + r + 1] = color
 
         if info:
+            if info.get("start") is not None:
+                dot(*info["start"], (0, 210, 230), 4)
+            for visited in info.get("visited_targets") or []:
+                dot(*visited, (220, 40, 40), 4)
             for c in info.get("crumbs") or []:
                 dot(c[0], c[1], (255, 165, 0), 1)
             for p in info.get("waypoints") or []:
@@ -51,18 +62,18 @@ class MapViz:
                 dot(info["goal"][0], info["goal"][1], (0, 80, 255), 3)
             if info.get("target_est"):
                 dot(info["target_est"][0], info["target_est"][1],
-                    (255, 0, 0), 4)
+                    (255, 210, 0), 4)  # yellow = unvisited estimated position
         if pose is not None:
             dot(pose[0], pose[1], (0, 190, 0), 3)
             tip = (pose[0] + 0.28 * math.cos(pose[2]),
                    pose[1] + 0.28 * math.sin(pose[2]))
             dot(tip[0], tip[1], (0, 120, 0), 1)
-        mpimage.imsave(path, img[::-1])   # origin='lower' 뒤집기
+        save_rgb(path, img[::-1])   # origin='lower' 뒤집기
 
     @staticmethod
     def save_camera(path, img_rgb, det=None, yolo_boxes=()):
         """카메라 라이브 뷰: HSV 블롭(노랑)·YOLO 박스(초록) 테두리 합성."""
-        if not HAVE_MPL or img_rgb is None:
+        if img_rgb is None:
             return
         out = img_rgb.copy()
         hh, ww = out.shape[:2]
@@ -81,7 +92,16 @@ class MapViz:
             rect(a, b, c, d, (0, 255, 0))
         if det is not None and det.bbox is not None:
             rect(*det.bbox, (255, 255, 0))
-        mpimage.imsave(path, out)
+        canvas = Image.fromarray(out)
+        draw = ImageDraw.Draw(canvas)
+        for name, confidence, (x0, y0, _, _) in yolo_boxes:
+            text = f'{name} {confidence:.2f}'
+            xy = (max(0, int(x0)), max(0, int(y0) - 13))
+            draw.rectangle(draw.textbbox(xy, text), fill=(0, 0, 0))
+            draw.text(xy, text, fill=(0, 255, 0))
+        buf = io.BytesIO()
+        canvas.save(buf, format='PNG', compress_level=1)
+        atomic_write(path, buf.getvalue())
 
     def save(self, path, pose=None, info=None, true_pose=None, world_extras=None):
         if not self.enabled:

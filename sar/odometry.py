@@ -1,10 +1,4 @@
-"""바퀴 인코더 기반 차동구동 odometry.
-
-시작 포즈는 대회에서 제공되므로(config.mission.start_*) 절대좌표의 기준이 된다.
-짧은 주행(3시간 대회의 수 분짜리 미션)에서는 시뮬레이션 특성상 미끄러짐이
-거의 없어 odometry 단독으로도 복귀 정밀도를 확보할 수 있다는 전제.
-드리프트가 크면 scan matching을 붙일 자리는 PoseEstimator 하나로 격리돼 있다.
-"""
+"""Encoder/compass odometry with optional local LiDAR map correction."""
 import math
 
 from .geometry import wrap_angle
@@ -77,6 +71,10 @@ class PoseEstimator:
 
     def __init__(self, cfg, start_pose):
         self.odom = DiffDriveOdometry(cfg, start_pose)
+        self.matcher = None
+        if cfg.localization.enabled:
+            from .localization import ScanMatcher
+            self.matcher = ScanMatcher(cfg)
         self._start_theta = start_pose[2]
         self._compass_offset = None
 
@@ -93,3 +91,9 @@ class PoseEstimator:
                     self._start_theta - compass_raw)
             heading = wrap_angle(compass_raw + self._compass_offset)
         return self.odom.update(left_pos, right_pos, heading=heading)
+
+    def correct_with_scan(self, grid, angles, ranges):
+        if self.matcher is not None:
+            self.odom.x, self.odom.y, _ = self.matcher.match(
+                grid, self.pose, angles, ranges)
+        return self.pose
